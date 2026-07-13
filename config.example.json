@@ -1,0 +1,19 @@
+{
+  "listen_port": "3000",
+  "models": [
+    {"name": "big-pickle", "upstream": "opencode"},
+    {"name": "hy3-free", "upstream": "opencode"},
+    {"name": "my-model", "upstream": "custom"}
+  ],
+  "upstreams": [
+    {
+      "name": "custom",
+      "base_url": "https://api.example.com/v1",
+      "api_key": "REPLACE_ME"
+    }
+  ],
+  "request_timeout": "5m",
+  "model_cache_ttl": "5m",
+  "log_level": "info",
+  "log_format": "text"
+}

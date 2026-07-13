@@ -1,0 +1,12 @@
+/claude-proxy
+*.exe
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+.claude/worktrees/
+config.json
+!config.example.json

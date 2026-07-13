@@ -1,0 +1,30 @@
+# Initialize local configuration once: cp config.example.json config.json
+services:
+  claude-proxy:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:?Run with VERSION=$(printf '%X' $(date +%s))}
+    container_name: claude-proxy
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./config.json:/app/config.json
+      - claude-proxy-data:/tmp
+    working_dir: /app
+    environment:
+      # --- Ordered model routing ---
+      MODELS: big-pickle@opencode,deepseek-v4-flash-free@opencode
+
+      # --- Logging ---
+      LOG_LEVEL: info
+      LOG_FORMAT: text
+    healthcheck:
+      test: ["CMD", "/app/claude-proxy", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  claude-proxy-data:

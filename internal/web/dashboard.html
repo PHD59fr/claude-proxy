@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>claude-proxy</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;padding:20px;max-width:900px;margin:0 auto}
+h1{font-size:1.5em;margin-bottom:4px;color:#58a6ff}
+.sub{color:#8b949e;margin-bottom:20px;font-size:.9em}
+.card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:16px;margin-bottom:16px}
+.card h2{font-size:1.1em;color:#c9d1d9;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.row{display:flex;align-items:center;padding:8px 0;border-bottom:1px solid #21262d;gap:10px}
+.row:last-child{border-bottom:none}
+.dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.dot.ok{background:#3fb950}
+.dot.err{background:#f85149}
+.dot.unknown{background:#8b949e}
+.name{flex:1;font-weight:500}
+.upstream{color:#8b949e;font-size:.85em;padding:2px 8px;border:1px solid #30363d;border-radius:12px}
+.order{color:#8b949e;font-size:.85em;width:24px;text-align:center}
+.btn{padding:5px 12px;border:1px solid #30363d;border-radius:4px;background:#21262d;color:#c9d1d9;cursor:pointer;font-size:.85em}
+.btn:hover{background:#30363d}
+.btn.primary{background:#238636;border-color:#2ea043;color:#fff}
+.btn.primary:hover{background:#2ea043}
+.btn.danger{background:#da3633;border-color:#f85149;color:#fff}
+.btn.danger:hover{background:#f85149}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn.sm{padding:2px 8px;font-size:.8em}
+.arrows{display:flex;gap:2px}
+.arrows button{padding:2px 6px;font-size:.75em}
+.actions{display:flex;gap:6px;align-items:center}
+.toast{position:fixed;bottom:20px;right:20px;padding:10px 16px;border-radius:6px;color:#fff;font-size:.9em;z-index:100;display:none}
+.toast.ok{background:#238636}
+.toast.err{background:#da3633}
+.toolbar{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
+#status-line{color:#8b949e;font-size:.85em;margin-bottom:8px}
+.src{font-size:.75em;color:#8b949e;margin-left:6px}
+.src.locked{color:#d29922}
+.form{display:grid;grid-template-columns:1fr 1fr;gap:10px 20px}
+.form.full{grid-template-columns:1fr}
+.fg{display:flex;flex-direction:column;gap:3px}
+.fg label{font-size:.85em;color:#8b949e}
+.fg input,.fg select{background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:6px 10px;color:#c9d1d9;font-size:.9em;font-family:inherit}
+.fg input:focus,.fg select:focus{outline:none;border-color:#58a6ff}
+.fg textarea{background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:6px 10px;color:#c9d1d9;font-size:.85em;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;min-height:60px;resize:vertical}
+.fg .hint{font-size:.75em;color:#8b949e}
+.route-picker{display:flex;gap:6px;flex-wrap:wrap;padding-top:2px}
+.route-pill{border:1px solid #30363d;background:#0d1117;color:#c9d1d9;border-radius:14px;padding:4px 9px;cursor:pointer;font-size:.8em;display:flex;align-items:center;gap:5px}
+.route-pill:hover{border-color:#58a6ff}.route-pill.selected{border-color:#238636;background:#143d26;color:#fff}
+.route-pill .dot{width:7px;height:7px}
+.toggle{display:flex;align-items:center;gap:8px}
+.toggle input[type=checkbox]{width:18px;height:18px;accent-color:#238636}
+.badge{font-size:.7em;padding:2px 6px;border-radius:8px;background:#da3633;color:#fff;font-weight:600;vertical-align:middle}
+.badge.live{background:#238636}
+.upstream-item{background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:12px;margin-bottom:8px}
+.upstream-item h3{font-size:.95em;color:#58a6ff;margin-bottom:8px}
+.upstream-item .form{grid-template-columns:1fr 1fr}
+.upstream-item .row-actions{display:flex;gap:6px;margin-top:8px}
+hr.sep{border:0;border-top:1px solid #21262d;margin:16px 0}
+</style>
+</head>
+<body>
+<h1>claude-proxy</h1>
+<p class="sub">Configuration &amp; uptime dashboard</p>
+
+<!-- Models -->
+<div class="card">
+<h2>Models</h2>
+<div id="status-line"></div>
+<div class="toolbar">
+<button class="btn primary" onclick="testAll()">Test All</button>
+<button class="btn danger" onclick="resetBreakers()">Reset Circuit Breakers</button>
+<button class="btn" onclick="loadModels()">Refresh</button>
+</div>
+<div id="models"></div>
+</div>
+
+<!-- Routing -->
+<div class="card">
+<h2>Routing <span class="badge live">live</span></h2>
+<p class="sub" style="margin-bottom:10px">The first model in the ordered list is the default. Reasoning and completion routes pick an optional preferred model tried before the ordered list. Select <strong>First in order</strong> to use the normal preference list.</p>
+<div class="form">
+<div class="fg"><label>Reasoning model <span class="hint">used when thinking is enabled</span></label><div id="cfg-reasoning" class="route-picker"></div></div>
+<div class="fg"><label>Completion model <span class="hint">used for standard requests</span></label><div id="cfg-completion" class="route-picker"></div></div>
+</div>
+<div class="form full" style="margin-top:10px">
+<div class="toggle"><input type="checkbox" id="cfg-allow"><label for="cfg-allow">Allow unlisted models</label></div>
+<div class="toggle"><input type="checkbox" id="cfg-expose"><label for="cfg-expose">Expose all upstream models</label></div>
+</div>
+</div>
+
+<!-- Upstreams -->
+<div class="card">
+<h2>Upstreams</h2>
+<p class="sub" style="margin-bottom:12px">Custom providers. The built-in endpoint is implicit and does not need configuration.</p>
+<div id="upstreams"></div>
+<button class="btn" onclick="addUpstream()">+ Add upstream</button>
+</div>
+
+<!-- Security -->
+<div class="card">
+<h2>Security</h2>
+<div class="form">
+<div class="fg"><label>Inbound API key <span class="hint">write-only</span></label><input id="cfg-inbound" type="password" placeholder="(none)"></div>
+<div class="fg"><label style="visibility:hidden">passthrough</label><div class="toggle"><input type="checkbox" id="cfg-passthrough"><label for="cfg-passthrough">API key passthrough (clients must provide their own key)</label></div></div>
+</div>
+</div>
+
+<!-- Operations -->
+<div class="card">
+<h2>Operations</h2>
+<div class="form">
+<div class="fg"><label>Request timeout<span class="src" id="src-timeout"></span></label><input id="cfg-timeout" placeholder="5m0s"></div>
+<div class="fg"><label>Model cache TTL<span class="src" id="src-cachettl"></span></label><input id="cfg-cachettl" placeholder="5m0s"></div>
+<div class="fg"><label>Max body size <span class="hint">bytes</span></label><input id="cfg-maxbody" type="number" placeholder="10485760"></div>
+<div class="fg"><label>Log level<span class="src" id="src-loglevel"></span></label><select id="cfg-loglevel"><option>debug</option><option>info</option><option>warn</option><option>error</option></select></div>
+<div class="fg"><label>Log format<span class="src" id="src-logformat"></span></label><select id="cfg-logformat"><option>text</option><option>json</option></select></div>
+</div>
+</div>
+
+<!-- Codex -->
+<div class="card">
+<h2>Codex (ChatGPT)</h2>
+<div class="form">
+<div class="fg"><label>Account ID</label><input id="cfg-codex-id" readonly></div>
+<div class="fg"><label>Status</label><input id="cfg-codex-status" readonly></div>
+</div>
+<div style="margin-top:10px"><button class="btn primary" onclick="codexLogin()">Re-login with ChatGPT</button></div>
+</div>
+
+<!-- Server -->
+<div class="card">
+<h2>Server <span class="badge">restart required</span></h2>
+<div class="form">
+<div class="fg"><label>Listen port<span class="src" id="src-port"></span></label><input id="cfg-port" placeholder="3000"></div>
+<div class="fg"><label>Web interface port<span class="src" id="src-webport"></span></label><input id="cfg-webport" placeholder="8080"></div>
+</div>
+</div>
+
+<!-- Save -->
+<div class="toolbar" style="margin-top:8px">
+<button class="btn primary" onclick="saveConfig()" style="font-size:1em;padding:8px 24px">Save Configuration</button>
+<button class="btn" onclick="loadConfig()">Discard Changes</button>
+<span id="save-status" style="color:#8b949e;font-size:.85em;margin-left:8px"></span>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+let models=[], cfg={}, upstreams=[];
+const esc=s=>(s+'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function toast(msg,ok){const t=document.getElementById('toast');t.textContent=msg;t.className='toast '+(ok?'ok':'err');t.style.display='block';setTimeout(()=>t.style.display='none',3000);}
+
+// Extract value from fieldInfo{value,source,locked} or plain value
+function V(x){return x&&typeof x==='object'&&!Array.isArray(x)&&('value'in x||'source'in x)?x.value:x;}
+function S(x){return x&&typeof x==='object'&&('source' in x)?(x.source||'default'):'';}
+function L(x){return x&&typeof x==='object'&&('locked' in x)?x.locked:false;}
+
+// ── Models ──
+async function loadModels(){try{const r=await fetch('/api/models');models=await r.json();renderModels();document.getElementById('status-line').textContent=models.length+' models loaded';}catch(e){toast('Failed to load models',false);}}
+function renderModels(){document.getElementById('models').innerHTML=models.map((m,i)=>'<div class="row"><span class="dot '+(!m.tested?'unknown':(m.ok?'ok':'err'))+'" title="'+(!m.tested?'not tested':(m.ok?'available':(m.last_error||'unavailable')))+'"></span><span class="order">'+m.order+'</span><span class="name">'+esc(m.name)+'</span>'+(m.upstream?'<span class="upstream">'+esc(m.upstream)+'</span>':'')+'<div class="actions"><div class="arrows">'+(i>0?'<button class="btn sm" onclick="move('+i+',-1)">▲</button>':'<button class="btn sm" disabled>▲</button>')+(i<models.length-1?'<button class="btn sm" onclick="move('+i+',1)">▼</button>':'<button class="btn sm" disabled>▼</button>')+'</div><button class="btn sm" onclick="testOne('+i+')">Test</button></div></div>').join('');}
+async function move(i,j){j=i+j;if(j<0||j>=models.length)return;[models[i],models[j]]=[models[j],models[i]];renderModels();await fetch('/api/models/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({models:models.map(m=>m.name)})});toast('Order saved',true);}
+async function testOne(i){const m=models[i],b=event.target;b.disabled=true;b.textContent='...';try{const r=await fetch('/api/models/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:m.name})});const res=await r.json();models[i].ok=res.ok;renderModels();toast(m.name+': '+(res.ok?'OK':res.error),res.ok);}catch(e){toast('Test failed',false);}b.disabled=false;b.textContent='Test';}
+async function testAll(){const b=event.target;b.disabled=true;b.textContent='Testing...';for(let i=0;i<models.length;i++){models[i].ok=false;renderModels();try{const r=await fetch('/api/models/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:models[i].name})});models[i].ok=(await r.json()).ok;}catch(e){}renderModels();}b.disabled=false;b.textContent='Test All';toast('All tests complete',true);}
+async function resetBreakers(){await fetch('/api/circuit-breaker/reset',{method:'POST'});toast('Circuit breakers reset',true);loadModels();}
+
+// ── Config ──
+function cfgToUI(c){
+renderRoutePicker('cfg-reasoning', V(c.reasoning_model)||'');
+renderRoutePicker('cfg-completion', V(c.completion_model)||'');
+document.getElementById('cfg-allow').checked=!!V(c.allow_unlisted);
+document.getElementById('cfg-expose').checked=!!V(c.expose_all);
+document.getElementById('cfg-inbound').value='';
+document.getElementById('cfg-passthrough').checked=!!V(c.passthrough);
+document.getElementById('cfg-timeout').value=V(c.request_timeout)||'';
+document.getElementById('cfg-cachettl').value=V(c.model_cache_ttl)||'';
+document.getElementById('cfg-maxbody').value=V(c.max_body_size)||'';
+document.getElementById('cfg-loglevel').value=V(c.log_level)||'info';
+document.getElementById('cfg-logformat').value=V(c.log_format)||'text';
+document.getElementById('cfg-port').value=V(c.listen_port)||'3000';
+document.getElementById('cfg-webport').value=V(c.web_interface_port)||'';
+document.getElementById('cfg-codex-id').value=V(c.codex_account_id)||'(not configured)';
+document.getElementById('cfg-codex-status').value=V(c.codex_account_id)?'authenticated':'not configured';
+// Show sources next to Operations fields
+setSource('src-timeout', c.request_timeout);
+setSource('src-cachettl', c.model_cache_ttl);
+setSource('src-loglevel', c.log_level);
+setSource('src-logformat', c.log_format);
+setSource('src-port', c.listen_port);
+setSource('src-webport', c.web_interface_port);
+upstreams=V(c.upstreams)||[];
+renderUpstreams();
+}
+
+function setSource(id, field){
+const el=document.getElementById(id);
+if(!el)return;
+const src=S(field);
+const locked=L(field);
+el.textContent=src?locked?'🔒 '+src:src:'';
+el.className='src'+(locked?' locked':'');
+}
+
+function renderRoutePicker(id, selected){
+const el=document.getElementById(id);
+const candidates=models.filter(m=>m.configured);
+const pills=[{name:'First in order',value:'',tested:true,ok:true},...candidates];
+el.dataset.value=selected;
+el.innerHTML=pills.map(p=>'<button type="button" class="route-pill '+(p.value===selected?'selected':'')+'" onclick="chooseRoute(\''+id+'\',\''+esc(p.value)+'\')"><span class="dot '+(!p.tested?'unknown':(p.ok?'ok':'err'))+'"></span>'+esc(p.name)+'</button>').join('');
+}
+function chooseRoute(id,value){renderRoutePicker(id,value);}
+
+function uiToCfg(){
+const c={};
+const port=document.getElementById('cfg-port').value||'3000';
+c.listen_port=port;
+c.web_interface_port=document.getElementById('cfg-webport').value;
+c.reasoning_model=document.getElementById('cfg-reasoning').dataset.value||'';
+c.completion_model=document.getElementById('cfg-completion').dataset.value||'';
+c.allow_unlisted_models=document.getElementById('cfg-allow').checked;
+c.expose_all_models=document.getElementById('cfg-expose').checked;
+c.passthrough_api_key=document.getElementById('cfg-passthrough').checked;
+c.request_timeout=document.getElementById('cfg-timeout').value;
+c.model_cache_ttl=document.getElementById('cfg-cachettl').value;
+c.max_body_size=parseInt(document.getElementById('cfg-maxbody').value)||0;
+c.log_level=document.getElementById('cfg-loglevel').value;
+c.log_format=document.getElementById('cfg-logformat').value;
+c.upstreams=upstreams;
+const ik=document.getElementById('cfg-inbound').value;
+if(ik)c.inbound_api_key=ik;
+return c;
+}
+
+// ── Upstreams ──
+function renderUpstreams(){
+document.getElementById('upstreams').innerHTML=upstreams.map((u,i)=>'<div class="upstream-item"><h3>'+esc(u.name||'(unnamed)')+'</h3><div class="form"><div class="fg"><label>Name</label><input value="'+esc(u.name)+'" onchange="upstreams['+i+'].name=this.value;renderUpstreams()"></div><div class="fg"><label>Base URL</label><input value="'+esc(u.base_url)+'" onchange="upstreams['+i+'].base_url=this.value" placeholder="https://api.example.com/v1"></div><div class="fg"><label>API key <span class="hint">write-only</span></label><input type="password" placeholder="(empty = keep current)" onchange="upstreams['+i+'].api_key=this.value"></div></div><div class="row-actions"><button class="btn sm" onclick="testUpstream('+i+')">Test Connectivity</button><button class="btn sm danger" onclick="upstreams.splice('+i+',1);renderUpstreams()">Remove</button></div></div>').join('');
+}
+function addUpstream(){upstreams.push({name:'',base_url:'',api_key:''});renderUpstreams();}
+async function testUpstream(i){const u=upstreams[i];if(!u.name){toast('Upstream needs a name',false);return;}try{toast('Testing '+u.name+'...',true);await testAll();}catch(e){toast('Test failed',false);}}
+
+// ── Codex ──
+async function codexLogin(){
+const b=event.target;b.disabled=true;b.textContent='Starting...';
+try{
+const r=await fetch('/api/codex/login',{method:'POST'});
+const res=await r.json();
+if(res.auth_url){
+toast('Browser opened. Complete login in the popup.',true);
+window.open(res.auth_url,'_blank');
+pollCodexStatus();
+}else{
+toast('Codex login failed',false);
+b.disabled=false;b.textContent='Re-login with ChatGPT';
+}
+}catch(e){toast('Codex login failed: '+e.message,false);b.disabled=false;b.textContent='Re-login with ChatGPT';}
+}
+function pollCodexStatus(){
+fetch('/api/codex/login/status').then(r=>r.json()).then(s=>{
+if(s.status==='completed'){toast('Codex login successful',true);loadConfig();document.querySelector('#cfg-codex-status').value='authenticated';return;}
+if(s.status==='error'){toast('Codex login failed: '+(s.error||'unknown'),false);document.querySelector('#cfg-codex-status').value='failed';return;}
+setTimeout(pollCodexStatus,2000);
+}).catch(()=>setTimeout(pollCodexStatus,2000));
+}
+
+// ── Load / Save ──
+async function loadConfig(){try{const r=await fetch('/api/config');cfg=await r.json();cfgToUI(cfg);document.getElementById('save-status').textContent='';}catch(e){toast('Failed to load configuration',false);}}
+async function saveConfig(){const data=uiToCfg();try{const r=await fetch('/api/config/save',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});if(!r.ok){toast(await r.text(),false);return;}toast('Configuration saved',true);document.getElementById('save-status').textContent='Saved — listener/port changes require restart';loadModels();}catch(e){toast('Configuration save failed',false);}}
+
+loadModels();loadConfig();
+setInterval(loadModels,30000);
+</script>
+</body>
+</html>

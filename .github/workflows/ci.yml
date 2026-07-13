@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  schedule:
+    - cron: "0 4 * * 1" # Weekly rebuild (Monday 04:00 UTC) to pick up Alpine patches
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: phd59fr/claude-proxy
+
+jobs:
+  # ── Code quality ────────────────────────────────────────────────────────────
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.11.1
+          args: --timeout=5m
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run tests
+        run: go test -race -coverprofile=coverage.out -count=1 -timeout=60s ./...
+      - name: Run static analysis
+        run: go vet ./...
+      - name: Check formatting
+        run: make fmt-check
+      - name: Validate safe config template
+        run: |
+          test ! -e config.json || ! git ls-files --error-unmatch config.json >/dev/null 2>&1
+          python3 -m json.tool config.example.json >/dev/null
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  # ── Build binary ─────────────────────────────────────────────────────────────
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build binary
+        run: |
+          VERSION=$(printf '%X' "$(date +%s)")
+          CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=$VERSION" -o claude-proxy ./cmd/claude-proxy/
+
+  # ── Docker image ─────────────────────────────────────────────────────────────
+
+  docker:
+    name: Docker
+    runs-on: ubuntu-latest
+    needs: build
+    if: |
+      github.ref == 'refs/heads/master' ||
+      github.event_name == 'pull_request' ||
+      github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Generate build version
+        id: version
+        run: echo "value=$(printf '%X' \"$(date +%s)\")" >> "$GITHUB_OUTPUT"
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - name: Log in to Docker Hub
+        if: github.ref == 'refs/heads/master' || github.event_name == 'schedule'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: |
+            VERSION=${{ steps.version.outputs.value }}
+          push: ${{ github.ref == 'refs/heads/master' || github.event_name == 'schedule' }}
+          load: ${{ github.ref != 'refs/heads/master' && github.event_name != 'schedule' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test runtime image
+        if: github.ref != 'refs/heads/master' && github.event_name != 'schedule'
+        run: |
+          image="${{ env.IMAGE_NAME }}:latest"
+          docker run -d --rm --name claude-proxy-smoke -p 3000:3000 "$image"
+          trap 'docker logs claude-proxy-smoke; docker stop claude-proxy-smoke || true' EXIT
+          for i in $(seq 1 20); do
+            docker exec claude-proxy-smoke /app/claude-proxy healthcheck && exit 0
+            sleep 1
+          done
+          exit 1
