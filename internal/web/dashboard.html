@@ -94,7 +94,12 @@ hr.sep{border:0;border-top:1px solid #21262d;margin:16px 0}
 <!-- Upstreams -->
 <div class="card">
 <h2>Upstreams</h2>
-<p class="sub" style="margin-bottom:12px">Custom providers. The built-in endpoint is implicit and does not need configuration.</p>
+<p class="sub" style="margin-bottom:12px">OpenCode Zen requires an API key from <a href="https://opencode.ai/auth" target="_blank" rel="noreferrer" style="color:#58a6ff">opencode.ai/auth</a>. The key is write-only.</p>
+<div class="form" style="margin-bottom:14px">
+<div class="fg"><label>Zen base URL<span class="src" id="src-zen-url"></span></label><input id="cfg-zen-url" placeholder="https://opencode.ai/zen/v1"></div>
+<div class="fg"><label>Zen API key <span class="hint" id="cfg-zen-key-status">write-only</span></label><input id="cfg-zen-key" type="password" placeholder="Enter a Zen API key"></div>
+</div>
+<p class="sub" style="margin-bottom:8px">Additional OpenAI-compatible providers:</p>
 <div id="upstreams"></div>
 <button class="btn" onclick="addUpstream()">+ Add upstream</button>
 </div>
@@ -150,7 +155,7 @@ hr.sep{border:0;border-top:1px solid #21262d;margin:16px 0}
 
 <script>
 let models=[], cfg={}, upstreams=[];
-const esc=s=>(s+'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const esc=s=>(s+'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 function toast(msg,ok){const t=document.getElementById('toast');t.textContent=msg;t.className='toast '+(ok?'ok':'err');t.style.display='block';setTimeout(()=>t.style.display='none',3000);}
 
 // Extract value from fieldInfo{value,source,locked} or plain value
@@ -160,10 +165,10 @@ function L(x){return x&&typeof x==='object'&&('locked' in x)?x.locked:false;}
 
 // ── Models ──
 async function loadModels(){try{const r=await fetch('/api/models');models=await r.json();renderModels();document.getElementById('status-line').textContent=models.length+' models loaded';}catch(e){toast('Failed to load models',false);}}
-function renderModels(){document.getElementById('models').innerHTML=models.map((m,i)=>'<div class="row"><span class="dot '+(!m.tested?'unknown':(m.ok?'ok':'err'))+'" title="'+(!m.tested?'not tested':(m.ok?'available':(m.last_error||'unavailable')))+'"></span><span class="order">'+m.order+'</span><span class="name">'+esc(m.name)+'</span>'+(m.upstream?'<span class="upstream">'+esc(m.upstream)+'</span>':'')+'<div class="actions"><div class="arrows">'+(i>0?'<button class="btn sm" onclick="move('+i+',-1)">▲</button>':'<button class="btn sm" disabled>▲</button>')+(i<models.length-1?'<button class="btn sm" onclick="move('+i+',1)">▼</button>':'<button class="btn sm" disabled>▼</button>')+'</div><button class="btn sm" onclick="testOne('+i+')">Test</button></div></div>').join('');}
+function renderModels(){document.getElementById('models').innerHTML=models.map((m,i)=>'<div class="row"><span class="dot '+(!m.tested?'unknown':(m.ok?'ok':'err'))+'" title="'+esc(!m.tested?'not tested':(m.ok?'available':(m.last_error||'unavailable')))+'"></span><span class="order">'+m.order+'</span><span class="name">'+esc(m.name)+'</span>'+(m.upstream?'<span class="upstream">'+esc(m.upstream)+'</span>':'')+'<div class="actions"><div class="arrows">'+(i>0?'<button class="btn sm" onclick="move('+i+',-1)">▲</button>':'<button class="btn sm" disabled>▲</button>')+(i<models.length-1?'<button class="btn sm" onclick="move('+i+',1)">▼</button>':'<button class="btn sm" disabled>▼</button>')+'</div><button class="btn sm" onclick="testOne('+i+')">Test</button></div></div>').join('');}
 async function move(i,j){j=i+j;if(j<0||j>=models.length)return;[models[i],models[j]]=[models[j],models[i]];renderModels();await fetch('/api/models/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({models:models.map(m=>m.name)})});toast('Order saved',true);}
-async function testOne(i){const m=models[i],b=event.target;b.disabled=true;b.textContent='...';try{const r=await fetch('/api/models/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:m.name})});const res=await r.json();models[i].ok=res.ok;renderModels();toast(m.name+': '+(res.ok?'OK':res.error),res.ok);}catch(e){toast('Test failed',false);}b.disabled=false;b.textContent='Test';}
-async function testAll(){const b=event.target;b.disabled=true;b.textContent='Testing...';for(let i=0;i<models.length;i++){models[i].ok=false;renderModels();try{const r=await fetch('/api/models/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:models[i].name})});models[i].ok=(await r.json()).ok;}catch(e){}renderModels();}b.disabled=false;b.textContent='Test All';toast('All tests complete',true);}
+async function testOne(i){const m=models[i],b=event.target;b.disabled=true;b.textContent='...';try{const r=await fetch('/api/models/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:m.name})});const res=await r.json();models[i].ok=res.ok;models[i].tested=true;renderModels();toast(m.name+': '+(res.ok?'OK':res.error),res.ok);}catch(e){toast('Test failed',false);}b.disabled=false;b.textContent='Test';}
+async function testAll(){const b=event.target;b.disabled=true;b.textContent='Testing...';for(let i=0;i<models.length;i++){models[i].ok=false;renderModels();try{const r=await fetch('/api/models/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:models[i].name})});models[i].ok=(await r.json()).ok;models[i].tested=true;}catch(e){}renderModels();}b.disabled=false;b.textContent='Test All';toast('All tests complete',true);}
 async function resetBreakers(){await fetch('/api/circuit-breaker/reset',{method:'POST'});toast('Circuit breakers reset',true);loadModels();}
 
 // ── Config ──
@@ -183,6 +188,10 @@ document.getElementById('cfg-port').value=V(c.listen_port)||'3000';
 document.getElementById('cfg-webport').value=V(c.web_interface_port)||'';
 document.getElementById('cfg-codex-id').value=V(c.codex_account_id)||'(not configured)';
 document.getElementById('cfg-codex-status').value=V(c.codex_account_id)?'authenticated':'not configured';
+document.getElementById('cfg-zen-url').value=V(c.zen_base_url)||'https://opencode.ai/zen/v1';
+document.getElementById('cfg-zen-key').value='';
+document.getElementById('cfg-zen-key').placeholder=c.zen_api_key&&c.zen_api_key.configured?'(configured; empty = keep current)':'Enter a Zen API key';
+document.getElementById('cfg-zen-key-status').textContent=c.zen_api_key&&c.zen_api_key.configured?'configured, write-only':'not configured';
 // Show sources next to Operations fields
 setSource('src-timeout', c.request_timeout);
 setSource('src-cachettl', c.model_cache_ttl);
@@ -190,6 +199,7 @@ setSource('src-loglevel', c.log_level);
 setSource('src-logformat', c.log_format);
 setSource('src-port', c.listen_port);
 setSource('src-webport', c.web_interface_port);
+setSource('src-zen-url', c.zen_base_url);
 upstreams=V(c.upstreams)||[];
 renderUpstreams();
 }
@@ -227,6 +237,9 @@ c.model_cache_ttl=document.getElementById('cfg-cachettl').value;
 c.max_body_size=parseInt(document.getElementById('cfg-maxbody').value)||0;
 c.log_level=document.getElementById('cfg-loglevel').value;
 c.log_format=document.getElementById('cfg-logformat').value;
+c.zen_base_url=document.getElementById('cfg-zen-url').value;
+const uk=document.getElementById('cfg-zen-key').value;
+if(uk)c.zen_api_key=uk;
 c.upstreams=upstreams;
 const ik=document.getElementById('cfg-inbound').value;
 if(ik)c.inbound_api_key=ik;

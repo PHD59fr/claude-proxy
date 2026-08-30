@@ -15,14 +15,14 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.ListenAddr != "127.0.0.1:3000" {
 		t.Errorf("listen_addr = %q, want 127.0.0.1:3000", cfg.ListenAddr)
 	}
-	if cfg.UpstreamBaseURL != "https://opencode.ai/zen/v1" {
-		t.Errorf("upstream_base_url = %q", cfg.UpstreamBaseURL)
+	if cfg.ZenBaseURL != "https://opencode.ai/zen/v1" {
+		t.Errorf("zen_base_url = %q", cfg.ZenBaseURL)
 	}
-	if cfg.UpstreamAPIKey != "public" {
-		t.Errorf("upstream_api_key = %q", cfg.UpstreamAPIKey)
+	if cfg.ZenAPIKey != "" {
+		t.Errorf("zen_api_key = %q, want discovery mode", cfg.ZenAPIKey)
 	}
-	if cfg.DefaultModel != "big-pickle" {
-		t.Errorf("default_model = %q", cfg.DefaultModel)
+	if cfg.DefaultModel != "" {
+		t.Errorf("default_model = %q, want discovery mode", cfg.DefaultModel)
 	}
 	if cfg.RequestTimeout != 300*time.Second {
 		t.Errorf("request_timeout = %v", cfg.RequestTimeout)
@@ -31,8 +31,8 @@ func TestDefaultConfig(t *testing.T) {
 
 func TestLoad_EnvironmentVariables(t *testing.T) {
 	t.Setenv("LISTEN_ADDR", "0.0.0.0:8080")
-	t.Setenv("UPSTREAM_BASE_URL", "https://custom.api/v1")
-	t.Setenv("UPSTREAM_API_KEY", "custom-key")
+	t.Setenv("ZEN_BASE_URL", "https://custom.api/v1")
+	t.Setenv("ZEN_API_KEY", "custom-key")
 	t.Setenv("LOG_LEVEL", "debug")
 
 	cfg, err := Load([]string{"serve"})
@@ -43,19 +43,43 @@ func TestLoad_EnvironmentVariables(t *testing.T) {
 	if cfg.ListenAddr != "0.0.0.0:8080" {
 		t.Errorf("listen_addr = %q, want 0.0.0.0:8080", cfg.ListenAddr)
 	}
-	if cfg.UpstreamBaseURL != "https://custom.api/v1" {
-		t.Errorf("upstream_base_url = %q", cfg.UpstreamBaseURL)
+	if cfg.ZenBaseURL != "https://custom.api/v1" {
+		t.Errorf("zen_base_url = %q", cfg.ZenBaseURL)
 	}
-	if cfg.UpstreamAPIKey != "custom-key" {
-		t.Errorf("upstream_api_key = %q", cfg.UpstreamAPIKey)
+	if cfg.ZenAPIKey != "custom-key" {
+		t.Errorf("zen_api_key = %q", cfg.ZenAPIKey)
 	}
 	if cfg.LogLevel != "debug" {
 		t.Errorf("log_level = %q", cfg.LogLevel)
 	}
 }
 
+func TestLoad_ZenBaseURLLegacyEnvAlias(t *testing.T) {
+	t.Setenv("UPSTREAM_BASE_URL", "https://legacy.api/v1")
+	t.Setenv("ZEN_BASE_URL", "")
+	cfg, err := Load([]string{"serve"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ZenBaseURL != "https://legacy.api/v1" {
+		t.Errorf("zen_base_url via deprecated UPSTREAM_BASE_URL = %q, want https://legacy.api/v1", cfg.ZenBaseURL)
+	}
+}
+
+func TestLoad_ZenAPIKeyLegacyEnvAlias(t *testing.T) {
+	t.Setenv("UPSTREAM_API_KEY", "legacy-key")
+	t.Setenv("ZEN_API_KEY", "")
+	cfg, err := Load([]string{"serve"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ZenAPIKey != "legacy-key" {
+		t.Errorf("zen_api_key via deprecated UPSTREAM_API_KEY = %q, want legacy-key", cfg.ZenAPIKey)
+	}
+}
+
 func TestLoad_Flags(t *testing.T) {
-	args := []string{"serve", "--listen", "0.0.0.0:9090", "--upstream", "https://flag.api/v1", "--models", "flag-model"}
+	args := []string{"serve", "--listen", "0.0.0.0:9090", "--zen-base-url", "https://flag.api/v1", "--models", "flag-model"}
 
 	cfg, err := Load(args)
 	if err != nil {
@@ -65,14 +89,31 @@ func TestLoad_Flags(t *testing.T) {
 	if cfg.ListenAddr != "0.0.0.0:9090" {
 		t.Errorf("listen_addr = %q, want 0.0.0.0:9090", cfg.ListenAddr)
 	}
-	if cfg.UpstreamBaseURL != "https://flag.api/v1" {
-		t.Errorf("upstream_base_url = %q", cfg.UpstreamBaseURL)
+	if cfg.ZenBaseURL != "https://flag.api/v1" {
+		t.Errorf("zen_base_url = %q", cfg.ZenBaseURL)
 	}
 	if len(cfg.Models) != 1 || cfg.Models[0].Name != "flag-model" {
 		t.Errorf("models = %v, want [flag-model]", cfg.Models)
 	}
 	if cfg.DefaultModel != "flag-model" {
 		t.Errorf("default_model = %q, want flag-model (derived from models[0])", cfg.DefaultModel)
+	}
+}
+
+func TestLoad_FlagZenBaseURLAliases(t *testing.T) {
+	cfg, err := Load([]string{"serve", "--upstream", "https://legacy.api/v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ZenBaseURL != "https://legacy.api/v1" {
+		t.Errorf("--upstream alias = %q, want https://legacy.api/v1", cfg.ZenBaseURL)
+	}
+	cfg, err = Load([]string{"serve", "--zen-base-url", "https://canonical.api/v1", "--upstream", "https://legacy.api/v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ZenBaseURL != "https://canonical.api/v1" {
+		t.Errorf("--zen-base-url should win over --upstream, got %q", cfg.ZenBaseURL)
 	}
 }
 
@@ -98,7 +139,7 @@ func TestLoad_ConfigFile(t *testing.T) {
 
 	content := `{
 		"listen_addr": "0.0.0.0:7070",
-		"upstream_base_url": "https://file.api/v1",
+		"zen_base_url": "https://file.api/v1",
 		"models": ["file-model"]
 	}`
 	if err := os.WriteFile(configFile, []byte(content), 0644); err != nil {
@@ -114,8 +155,8 @@ func TestLoad_ConfigFile(t *testing.T) {
 	if cfg.ListenAddr != "0.0.0.0:7070" {
 		t.Errorf("listen_addr = %q, want 0.0.0.0:7070", cfg.ListenAddr)
 	}
-	if cfg.UpstreamBaseURL != "https://file.api/v1" {
-		t.Errorf("upstream_base_url = %q", cfg.UpstreamBaseURL)
+	if cfg.ZenBaseURL != "https://file.api/v1" {
+		t.Errorf("zen_base_url = %q", cfg.ZenBaseURL)
 	}
 	if len(cfg.Models) != 1 || cfg.Models[0].Name != "file-model" {
 		t.Errorf("models = %v, want [file-model]", cfg.Models)
@@ -161,12 +202,13 @@ func TestLoad_DurationEnvVars(t *testing.T) {
 
 func TestValidate(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.ZenAPIKey = "zen-key"
 	issues := cfg.Validate()
 	if len(issues) != 0 {
 		t.Errorf("default config has issues: %v", issues)
 	}
 
-	cfg.UpstreamBaseURL = ""
+	cfg.ZenBaseURL = ""
 	issues = cfg.Validate()
 	if len(issues) == 0 {
 		t.Error("expected validation issues for empty upstream URL")
@@ -192,7 +234,7 @@ func TestValidate_UnknownUpstream(t *testing.T) {
 
 func TestValidate_ReservedUpstreamName(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.Upstreams = []UpstreamConfig{{Name: "opencode", BaseURL: "https://x/v1", APIKey: "k"}}
+	cfg.Upstreams = []UpstreamConfig{{Name: "zen", BaseURL: "https://x/v1", APIKey: "k"}}
 	issues := cfg.Validate()
 	found := false
 	for _, i := range issues {
@@ -254,22 +296,21 @@ func TestParseModels(t *testing.T) {
 func TestMaskedKey(t *testing.T) {
 	cfg := DefaultConfig()
 
-	// Default config has "public" as key
-	if cfg.MaskedKey() != "***" {
-		t.Errorf("masked key = %q, want ***", cfg.MaskedKey())
+	if cfg.MaskedKey() != "" {
+		t.Errorf("masked key = %q, want empty", cfg.MaskedKey())
 	}
 
-	cfg.UpstreamAPIKey = ""
+	cfg.ZenAPIKey = ""
 	if cfg.MaskedKey() != "" {
 		t.Error("expected empty for empty key")
 	}
 
-	cfg.UpstreamAPIKey = "short"
+	cfg.ZenAPIKey = "short"
 	if cfg.MaskedKey() != "***" {
 		t.Errorf("masked key = %q, want ***", cfg.MaskedKey())
 	}
 
-	cfg.UpstreamAPIKey = "1234567890"
+	cfg.ZenAPIKey = "1234567890"
 	masked := cfg.MaskedKey()
 	if masked != "1234...7890" {
 		t.Errorf("masked key = %q, want 1234...7890", masked)
@@ -284,33 +325,68 @@ func TestString(t *testing.T) {
 	}
 }
 
-func TestPrecompute_DefaultModels(t *testing.T) {
+func TestPrecompute_DefaultDiscoveryMode(t *testing.T) {
 	cfg := DefaultConfig()
-
-	// DefaultConfig calls Precompute, so PrecomputedFallbacks should be set
-	if len(cfg.PrecomputedFallbacks) == 0 {
-		t.Fatal("PrecomputedFallbacks is empty")
+	if cfg.DefaultModel != "" || len(cfg.PrecomputedFallbacks) != 0 {
+		t.Fatalf("default config should wait for Zen discovery: %+v", cfg.PrecomputedFallbacks)
 	}
+}
 
-	// DefaultModel should always be the first entry
-	if cfg.PrecomputedFallbacks[0].Name != "big-pickle" {
-		t.Errorf("PrecomputedFallbacks[0] = %q, want big-pickle", cfg.PrecomputedFallbacks[0].Name)
+func TestValidate_OpenCodeZenRequiresKey(t *testing.T) {
+	cfg := DefaultConfig()
+	if issues := cfg.Validate(); len(issues) == 0 {
+		t.Fatal("expected missing Zen API key to fail validation")
 	}
-
-	// Should include all unique fallback models
-	seen := make(map[string]bool)
-	for _, m := range cfg.PrecomputedFallbacks {
-		if seen[m.Name] {
-			t.Errorf("duplicate model in PrecomputedFallbacks: %q", m.Name)
-		}
-		seen[m.Name] = true
+	cfg.ZenAPIKey = "public"
+	if issues := cfg.Validate(); len(issues) == 0 {
+		t.Fatal("expected legacy public key to fail validation")
 	}
+	cfg.ZenAPIKey = "zen-key"
+	if issues := cfg.Validate(); len(issues) != 0 {
+		t.Fatalf("real Zen key should validate: %v", issues)
+	}
+}
 
-	// Default fallback models should be present
-	for _, expected := range []string{"big-pickle", "deepseek-v4-flash-free", "hy3-free"} {
-		if !seen[expected] {
-			t.Errorf("missing expected model %q in PrecomputedFallbacks", expected)
-		}
+func TestValidate_KeyNotRequiredWithoutZenRoute(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *Config
+	}{
+		{
+			name: "custom only",
+			cfg: func() *Config {
+				c := DefaultConfig()
+				c.Models = []ModelSpec{{Name: "model", Upstream: "custom"}}
+				c.Upstreams = []UpstreamConfig{{Name: "custom", BaseURL: "https://example.com/v1"}}
+				c.Precompute()
+				return c
+			}(),
+		},
+		{
+			name: "codex only",
+			cfg: func() *Config {
+				c := DefaultConfig()
+				c.Models = []ModelSpec{{Name: "gpt-5.6-sol", Upstream: CodexUpstreamName}}
+				c.Precompute()
+				return c
+			}(),
+		},
+		{
+			name: "passthrough with service key",
+			cfg: func() *Config {
+				c := DefaultConfig()
+				c.PassthroughAPIKey = true
+				c.ZenAPIKey = "zen-key"
+				return c
+			}(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if issues := tt.cfg.Validate(); len(issues) != 0 {
+				t.Fatalf("unexpected validation issues: %v", issues)
+			}
+		})
 	}
 }
 
@@ -460,16 +536,79 @@ func TestLoad_UnifiedModelsFromFile(t *testing.T) {
 	}
 }
 
+func TestLoad_ZenAPIKeyFromFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "config.json")
+	if err := os.WriteFile(configFile, []byte(`{"zen_api_key":"from-zen-key"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load([]string{"serve", "--config", configFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ZenAPIKey != "from-zen-key" {
+		t.Errorf("zen_api_key from file = %q, want from-zen-key", cfg.ZenAPIKey)
+	}
+}
+
+func TestLoad_ZenAPIKeyLegacyFileAlias(t *testing.T) {
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "config.json")
+	if err := os.WriteFile(configFile, []byte(`{"upstream_api_key":"legacy-file-key"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load([]string{"serve", "--config", configFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ZenAPIKey != "legacy-file-key" {
+		t.Errorf("zen_api_key via deprecated upstream_api_key = %q, want legacy-file-key", cfg.ZenAPIKey)
+	}
+}
+
+func TestLoad_ZenBaseURLLegacyFileAlias(t *testing.T) {
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "config.json")
+	if err := os.WriteFile(configFile, []byte(`{"upstream_base_url":"https://legacy-file.api/v1"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load([]string{"serve", "--config", configFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ZenBaseURL != "https://legacy-file.api/v1" {
+		t.Errorf("zen_base_url via deprecated upstream_base_url = %q, want https://legacy-file.api/v1", cfg.ZenBaseURL)
+	}
+}
+
+func TestLoad_ZenKeyFlagAndAlias(t *testing.T) {
+	cfg, err := Load([]string{"serve", "--zen-key", "flag-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ZenAPIKey != "flag-key" {
+		t.Errorf("--zen-key = %q, want flag-key", cfg.ZenAPIKey)
+	}
+	cfg, err = Load([]string{"serve", "--upstream-key", "legacy-flag-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ZenAPIKey != "legacy-flag-key" {
+		t.Errorf("--upstream-key alias = %q, want legacy-flag-key", cfg.ZenAPIKey)
+	}
+}
+
 func TestLoad_ModelsWithUpstreamFlag(t *testing.T) {
+	// "@opencode" is a deprecated alias and must be normalized to "zen".
 	args := []string{"serve", "--models", "a@opencode,b@custom,c"}
 	cfg, err := Load(args)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []ModelSpec{
-		{Name: "a", Upstream: "opencode"},
+		{Name: "a", Upstream: "zen"},
 		{Name: "b", Upstream: "custom"},
-		{Name: "c", Upstream: "opencode"},
+		{Name: "c", Upstream: "zen"},
 	}
 	if len(cfg.Models) != len(want) {
 		t.Fatalf("Models = %v, want %v", cfg.Models, want)
@@ -488,7 +627,10 @@ func TestLoad_ModelsJSONFlag(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(cfg.Models) != 2 || cfg.Models[0].Name != "x" || cfg.Models[0].Upstream != "custom" {
-		t.Fatalf("Models = %v, want [{x custom} {y opencode}]", cfg.Models)
+		t.Fatalf("Models = %v, want [{x custom} {y zen}]", cfg.Models)
+	}
+	if cfg.Models[1].Name != "y" || cfg.Models[1].Upstream != "zen" {
+		t.Errorf("Models[1] = %+v, want {y zen} (legacy upstream_api_key alias normalized)", cfg.Models[1])
 	}
 }
 
@@ -531,5 +673,31 @@ func TestPrecompute_ModelsFirstIsDefault(t *testing.T) {
 	}
 	if cfg.PrecomputedFallbacks[2].Name != "fallback-b" {
 		t.Errorf("PrecomputedFallbacks[2] = %q, want fallback-b", cfg.PrecomputedFallbacks[2].Name)
+	}
+}
+
+func TestIsOpenCodeModelSupported(t *testing.T) {
+	for _, supported := range []string{"big-pickle", "future-free", "muse-spark-1.2-contributor-free"} {
+		if !IsOpenCodeModelSupported(supported) {
+			t.Errorf("model %q should be supported", supported)
+		}
+	}
+	for _, unsupported := range []string{"claude-sonnet", "qwen3", "gemini-2.5"} {
+		if IsOpenCodeModelSupported(unsupported) {
+			t.Errorf("model %q should be unsupported", unsupported)
+		}
+	}
+}
+
+func TestIsOpenCodeContributorFree(t *testing.T) {
+	for _, free := range []string{"muse-spark-1.2-contributor-free", "future-contributor-free"} {
+		if !IsOpenCodeContributorFree(free) {
+			t.Errorf("model %q should be contributor-free", free)
+		}
+	}
+	for _, notFree := range []string{"big-pickle", "future-free", "gpt-5.6-terra"} {
+		if IsOpenCodeContributorFree(notFree) {
+			t.Errorf("model %q should not be contributor-free", notFree)
+		}
 	}
 }

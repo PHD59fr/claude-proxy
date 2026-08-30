@@ -10,16 +10,39 @@ import (
 
 // TransformRequest converts an Anthropic MessageRequest to a Codex ResponsesRequest.
 func TransformRequest(req *anthropic.MessageRequest) (*ResponsesRequest, error) {
+	return transformRequest(req, true)
+}
+
+// TransformResponsesRequest converts an Anthropic request for a standard
+// OpenAI Responses API endpoint. Unlike Codex, it preserves model/tool IDs and
+// the caller's streaming choice and omits Codex-only reasoning fields.
+func TransformResponsesRequest(req *anthropic.MessageRequest) (*ResponsesRequest, error) {
+	return transformRequest(req, false)
+}
+
+func transformRequest(req *anthropic.MessageRequest, codexMode bool) (*ResponsesRequest, error) {
 	if req == nil {
 		return nil, fmt.Errorf("nil request")
 	}
 
-	model := NormalizeModel(req.Model)
+	model := req.Model
+	if codexMode {
+		model = NormalizeModel(model)
+	}
 
 	out := &ResponsesRequest{
-		Model:  model,
-		Store:  false,
-		Stream: true,
+		Model:           model,
+		Store:           false,
+		Stream:          req.Stream,
+		MaxOutputTokens: req.MaxTokens,
+		Temperature:     req.Temperature,
+		TopP:            req.TopP,
+	}
+	if codexMode {
+		out.Stream = true
+		out.MaxOutputTokens = 0
+		out.Temperature = nil
+		out.TopP = nil
 	}
 
 	// System prompt → instructions
@@ -29,7 +52,7 @@ func TransformRequest(req *anthropic.MessageRequest) (*ResponsesRequest, error) 
 
 	// Messages → input items
 	for _, msg := range req.Messages {
-		items, err := convertToInputItems(&msg)
+		items, err := convertToInputItems(&msg, codexMode)
 		if err != nil {
 			return nil, fmt.Errorf("convert message: %w", err)
 		}
@@ -49,9 +72,25 @@ func TransformRequest(req *anthropic.MessageRequest) (*ResponsesRequest, error) 
 			})
 		}
 	}
+	if !codexMode && req.ToolChoice != nil {
+		switch req.ToolChoice.Type {
+		case "any":
+			out.ToolChoice = "required"
+		case "none":
+			out.ToolChoice = "none"
+		case "tool":
+			out.ToolChoice = map[string]string{"type": "function", "name": req.ToolChoice.Name}
+		default:
+			out.ToolChoice = "auto"
+		}
+		if req.ToolChoice.DisableParallelToolUse {
+			disabled := false
+			out.ParallelToolCalls = &disabled
+		}
+	}
 
 	// Thinking → reasoning
-	if req.Thinking != nil && (req.Thinking.Type == "enabled" || req.Thinking.Type == "adaptive") {
+	if codexMode && req.Thinking != nil && (req.Thinking.Type == "enabled" || req.Thinking.Type == "adaptive") {
 		effort := "medium"
 		if req.Thinking.BudgetTokens != nil && *req.Thinking.BudgetTokens > 10000 {
 			effort = "high"
@@ -101,7 +140,7 @@ func extractSystemPrompt(raw json.RawMessage) string {
 }
 
 // convertToInputItems converts an Anthropic Message to Responses API InputItems.
-func convertToInputItems(msg *anthropic.Message) ([]InputItem, error) {
+func convertToInputItems(msg *anthropic.Message, codexMode bool) ([]InputItem, error) {
 	var items []InputItem
 
 	role := msg.Role
@@ -111,6 +150,14 @@ func convertToInputItems(msg *anthropic.Message) ([]InputItem, error) {
 
 	// Handle tool_result messages
 	for _, part := range msg.Content.Parts {
+		switch part.Type {
+		case "text", "image", "tool_use", "tool_result":
+		default:
+			return nil, fmt.Errorf("content block type %q is not supported", part.Type)
+		}
+		if part.Type == "image" && (part.Source == nil || part.Source.Type != "base64" || part.Source.MediaType == "" || part.Source.Data == "") {
+			return nil, fmt.Errorf("only base64 image sources are supported")
+		}
 		if part.Type == "tool_result" {
 			content := ""
 			switch c := part.Content.(type) {
@@ -128,9 +175,13 @@ func convertToInputItems(msg *anthropic.Message) ([]InputItem, error) {
 			if part.IsError {
 				content = "Error: " + content
 			}
+			callID := part.ToolUseID
+			if codexMode {
+				callID = codexFunctionCallID(callID)
+			}
 			items = append(items, InputItem{
 				Type:   "function_call_output",
-				CallID: codexFunctionCallID(part.ToolUseID),
+				CallID: callID,
 				Output: content,
 			})
 			continue
@@ -160,11 +211,14 @@ func convertToInputItems(msg *anthropic.Message) ([]InputItem, error) {
 
 	// Handle text content
 	var texts []string
+	var images []anthropic.ImageSource
 	var toolCalls []anthropic.ContentBlock
 	for _, part := range msg.Content.Parts {
 		switch part.Type {
 		case "text":
 			texts = append(texts, part.Text)
+		case "image":
+			images = append(images, *part.Source)
 		case "tool_use":
 			toolCalls = append(toolCalls, part)
 		}
@@ -172,11 +226,25 @@ func convertToInputItems(msg *anthropic.Message) ([]InputItem, error) {
 
 	// Text message
 	text := strings.Join(texts, "\n")
-	if text != "" {
+	if text != "" || len(images) > 0 {
+		var content interface{} = text
+		if len(images) > 0 {
+			parts := make([]map[string]interface{}, 0, len(images)+1)
+			if text != "" {
+				parts = append(parts, map[string]interface{}{"type": "input_text", "text": text})
+			}
+			for _, image := range images {
+				parts = append(parts, map[string]interface{}{
+					"type":      "input_image",
+					"image_url": fmt.Sprintf("data:%s;base64,%s", image.MediaType, image.Data),
+				})
+			}
+			content = parts
+		}
 		items = append(items, InputItem{
 			Type:    "message",
 			Role:    role,
-			Content: text,
+			Content: content,
 		})
 	}
 
@@ -188,7 +256,10 @@ func convertToInputItems(msg *anthropic.Message) ([]InputItem, error) {
 		}
 		// Codex backend requires function_call IDs to start with "fc".
 		// Anthropic sends IDs starting with "call_" — transform them.
-		fcID := codexFunctionCallID(tc.ID)
+		fcID := tc.ID
+		if codexMode {
+			fcID = codexFunctionCallID(fcID)
+		}
 		items = append(items, InputItem{
 			Type:      "function_call",
 			ID:        fcID,

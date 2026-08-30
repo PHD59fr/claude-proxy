@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,18 +8,18 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/claude-code-opencode/claude-proxy/internal/anthropic"
-	"github.com/claude-code-opencode/claude-proxy/internal/codex"
 	"github.com/claude-code-opencode/claude-proxy/internal/config"
-	"github.com/claude-code-opencode/claude-proxy/internal/convert"
 	"github.com/claude-code-opencode/claude-proxy/internal/log"
 	"github.com/claude-code-opencode/claude-proxy/internal/models"
-	"github.com/claude-code-opencode/claude-proxy/internal/openai"
-	"github.com/claude-code-opencode/claude-proxy/internal/upstream"
+	"github.com/claude-code-opencode/claude-proxy/internal/providers"
+	"github.com/claude-code-opencode/claude-proxy/internal/providers/codex"
+	"github.com/claude-code-opencode/claude-proxy/internal/providers/errs"
 )
 
 func isThinkingRequested(req *anthropic.MessageRequest) bool {
@@ -33,21 +32,25 @@ func isThinkingRequested(req *anthropic.MessageRequest) bool {
 type Handler struct {
 	cfg     atomic.Pointer[config.Config]
 	catalog *models.Catalog
-	router  *upstream.Router
+	router  atomic.Pointer[providers.Registry]
 	logger  *log.Logger
 
 	// disabledUntil maps a model key (upstream/model) to when it can be retried.
 	// The reason field tracks whether the disable was from a rate limit (429)
 	// or a transport/server error, so writePreferenceExhausted can return the
 	// correct HTTP status. Protected by disabledMu.
-	disabledMu    sync.Mutex
-	disabledUntil map[string]disableInfo
-	probeResults  map[string]modelProbeResult
+	disabledMu       sync.Mutex
+	disabledUntil    map[string]disableInfo
+	rateLimitRetries map[string]int // model key -> retry count for per-model 429
+	probeResults     map[string]modelProbeResult
+
+	discoveredMu    sync.RWMutex
+	discoveredCodex []codex.ModelInfo
 }
 
 type disableInfo struct {
 	until  time.Time
-	reason string // "rate_limit" or "error"
+	reason string // "rate_limit", "error", or "unavailable"
 }
 
 type modelProbeResult struct {
@@ -56,15 +59,16 @@ type modelProbeResult struct {
 	LastError string
 }
 
-func NewHandler(cfg *config.Config, catalog *models.Catalog, router *upstream.Router, logger *log.Logger) *Handler {
+func NewHandler(cfg *config.Config, catalog *models.Catalog, router *providers.Registry, logger *log.Logger) *Handler {
 	h := &Handler{
-		catalog:       catalog,
-		router:        router,
-		logger:        logger,
-		disabledUntil: make(map[string]disableInfo),
-		probeResults:  make(map[string]modelProbeResult),
+		catalog:          catalog,
+		logger:           logger,
+		disabledUntil:    make(map[string]disableInfo),
+		rateLimitRetries: make(map[string]int),
+		probeResults:     make(map[string]modelProbeResult),
 	}
 	h.cfg.Store(cfg)
+	h.router.Store(router)
 	return h
 }
 
@@ -74,9 +78,36 @@ func (h *Handler) loadConfig() *config.Config {
 	return h.cfg.Load()
 }
 
-// circuitBreakerCooldown is how long a model stays disabled after a failure
-// before it is tried again.
-const circuitBreakerCooldown = 15 * time.Minute
+func (h *Handler) loadRouter() *providers.Registry {
+	return h.router.Load()
+}
+
+func (h *Handler) replaceRouter(router *providers.Registry) {
+	h.router.Store(router)
+}
+
+// providerFor returns the provider that serves the given model spec, or nil
+// when it is not configured (e.g. a codex route without tokens).
+func (h *Handler) providerFor(spec config.ModelSpec) providers.Provider {
+	reg := h.loadRouter()
+	if reg == nil {
+		return nil
+	}
+	if spec.Upstream == config.CodexUpstreamName {
+		return reg.Codex()
+	}
+	return reg.Provider(spec.Upstream)
+}
+
+// circuitBreakerCooldown is how long a model stays disabled after a
+// transport error (5xx, connection failure) or after hitting the rate-limit
+// retry threshold (2nd 429). 1 hour to let free-tier quotas fully reset.
+const circuitBreakerCooldown = 60 * time.Minute
+
+// rateLimitCooldown is how long a model stays disabled after a single 429.
+// Free-tier quotas are bursty (per-window), so keep the cooldown short so a
+// once-limited model is retried quickly before the full 1-hour blacklist.
+const rateLimitCooldown = time.Minute
 
 // ─── Public methods for the web interface ───────────────────────────────────
 
@@ -108,6 +139,7 @@ func (h *Handler) webModelStatus(name, upstream string, order int, configured bo
 	h.disabledMu.Lock()
 	defer h.disabledMu.Unlock()
 	status := WebModelStatus{Name: name, Upstream: upstream, Order: order, Configured: configured}
+	modelKey := upstream + "/" + name
 	if probe, ok := h.probeResults[name]; ok {
 		status.Tested = true
 		status.OK = probe.OK
@@ -115,7 +147,7 @@ func (h *Handler) webModelStatus(name, upstream string, order int, configured bo
 		checkedAt := probe.CheckedAt
 		status.CheckedAt = &checkedAt
 	}
-	if info, disabled := h.disabledUntil[name]; disabled && time.Now().Before(info.until) {
+	if info, disabled := h.disabledUntil[modelKey]; disabled && time.Now().Before(info.until) {
 		status.OK = false
 		untilCopy := info.until
 		status.DisabledUntil = &untilCopy
@@ -132,24 +164,61 @@ func (h *Handler) GetModelStatuses() []WebModelStatus {
 			continue
 		}
 		seen[spec.Name] = true
+		if h.IsModelUpstreamUnavailable(spec.Upstream, spec.Name) {
+			// The upstream no longer serves this model — hide it from the
+			// dashboard instead of showing it red forever.
+			continue
+		}
 		statuses = append(statuses, h.webModelStatus(spec.Name, spec.Upstream, i+1, true))
 	}
-	for _, m := range models.DefaultModels {
-		if !seen[m.ID] {
+	for _, m := range h.catalog.CachedModels() {
+		if config.IsOpenCodeModelSupported(m.ID) && !seen[m.ID] {
 			seen[m.ID] = true
-			statuses = append(statuses, h.webModelStatus(m.ID, "", len(statuses)+1, false))
+			statuses = append(statuses, h.webModelStatus(m.ID, config.DefaultUpstreamName, len(statuses)+1, false))
 		}
 	}
-	for _, name := range []string{
-		"gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-		"gpt-5.4", "gpt-5.4-mini",
-	} {
-		if !seen[name] {
-			seen[name] = true
-			statuses = append(statuses, h.webModelStatus(name, "codex", len(statuses)+1, false))
+	for _, model := range h.DiscoveredCodexModels() {
+		if !seen[model.Slug] {
+			seen[model.Slug] = true
+			statuses = append(statuses, h.webModelStatus(model.Slug, config.CodexUpstreamName, len(statuses)+1, false))
 		}
 	}
 	return statuses
+}
+
+func (h *Handler) SetDiscoveredCodexModels(discovered []codex.ModelInfo) {
+	h.discoveredMu.Lock()
+	h.discoveredCodex = append([]codex.ModelInfo(nil), discovered...)
+	h.discoveredMu.Unlock()
+}
+
+func (h *Handler) DiscoveredCodexModels() []codex.ModelInfo {
+	h.discoveredMu.RLock()
+	defer h.discoveredMu.RUnlock()
+	return append([]codex.ModelInfo(nil), h.discoveredCodex...)
+}
+
+// ApplyDiscoveredOpenCodeModels initializes a fresh default configuration from
+// the current free Zen catalog. Explicit user model lists are never changed.
+func (h *Handler) ApplyDiscoveredOpenCodeModels(discovered []models.ModelEntry) {
+	current := h.loadConfig()
+	if len(current.Models) != 0 {
+		return
+	}
+	var specs []config.ModelSpec
+	for _, model := range models.FilteredModels(discovered) {
+		if !config.IsOpenCodeModelSupported(model.ID) || config.IsOpenCodeContributorFree(model.ID) {
+			continue
+		}
+		specs = append(specs, config.ModelSpec{Name: model.ID, Upstream: config.DefaultUpstreamName})
+	}
+	if len(specs) == 0 {
+		return
+	}
+	next := *current
+	next.Models = specs
+	next.Precompute()
+	h.UpdateConfig(&next)
 }
 
 // TestModel probes a single model and returns nil on success.
@@ -159,30 +228,27 @@ func (h *Handler) TestModel(ctx context.Context, name string) error {
 		if spec.Name != name {
 			continue
 		}
-		if spec.Upstream == config.CodexUpstreamName {
-			if h.router.Codex() == nil {
-				err = fmt.Errorf("codex not configured")
-			} else {
-				err = h.router.Codex().CheckModel(ctx, name)
-			}
-			h.RecordModelProbe(name, err)
-			return err
-		}
-		client, clientErr := h.router.ClientForModel(name, spec.Upstream)
-		if clientErr != nil {
-			err = clientErr
+		p := h.providerFor(spec)
+		if p == nil {
+			err = fmt.Errorf("no provider configured for upstream %q", spec.Upstream)
 		} else {
-			err = client.CheckChatCompletion(ctx, name)
+			err = p.Check(ctx, name)
+		}
+		if errors.Is(err, errs.ErrModelUnavailable) {
+			h.MarkModelUpstreamUnavailable(spec.Upstream, name)
 		}
 		h.RecordModelProbe(name, err)
 		return err
 	}
-	// Try as free model on default upstream.
-	client := h.router.DefaultClient()
-	if client == nil {
+	// Try as a free model on the built-in zen upstream.
+	p := h.loadRouter().Default()
+	if p == nil {
 		err = fmt.Errorf("no upstream for model %q", name)
 	} else {
-		err = client.CheckChatCompletion(ctx, name)
+		err = p.Check(ctx, name)
+	}
+	if errors.Is(err, errs.ErrModelUnavailable) {
+		h.MarkModelUpstreamUnavailable(config.DefaultUpstreamName, name)
 	}
 	h.RecordModelProbe(name, err)
 	return err
@@ -193,6 +259,16 @@ func (h *Handler) ResetCircuitBreakers() {
 	h.disabledMu.Lock()
 	defer h.disabledMu.Unlock()
 	h.disabledUntil = make(map[string]disableInfo)
+	h.rateLimitRetries = make(map[string]int)
+}
+
+// clearRateLimitRetry drops the 429 retry count for a model once it has
+// answered successfully, so the "N consecutive 429s" threshold only counts
+// back-to-back rate limits rather than accumulating for the process lifetime.
+func (h *Handler) clearRateLimitRetry(modelKey string) {
+	h.disabledMu.Lock()
+	delete(h.rateLimitRetries, modelKey)
+	h.disabledMu.Unlock()
 }
 
 // GetConfig returns the current configuration.
@@ -235,17 +311,128 @@ func (h *Handler) ReorderModels(names []string) {
 func (h *Handler) disableModel(name string, reason string) {
 	h.disabledMu.Lock()
 	defer h.disabledMu.Unlock()
-	if _, already := h.disabledUntil[name]; !already {
-		h.logger.Warn("model disabled by circuit breaker", "model", name, "cooldown", circuitBreakerCooldown, "reason", reason)
+
+	// Parse upstream/model from the key (format: "upstream/model" or "upstream/*")
+	upstreamName, modelName := parseModelKey(name)
+
+	cooldown := circuitBreakerCooldown
+	if reason == "rate_limit" {
+		// A single 429 is treated as a burst of free-quota exhaustion and must
+		// retried fast. Only the escalated blacklist (rate_limit_escalated) uses
+		// the long circuitBreakerCooldown.
+		cooldown = rateLimitCooldown
 	}
-	h.disabledUntil[name] = disableInfo{until: time.Now().Add(circuitBreakerCooldown), reason: reason}
+
+	// Discovered models (not in explicit config) get shorter cooldown on transport errors
+	// so they can be retried sooner as "best effort" fallbacks.
+	isConfigured := h.isConfiguredModel(upstreamName, modelName)
+	if !isConfigured && reason == "error" {
+		cooldown = 5 * time.Minute
+	}
+
+	until := time.Now().Add(cooldown)
+	if reason == "unavailable" {
+		until = time.Time{}
+		cooldown = 0
+	}
+
+	if existing, already := h.disabledUntil[name]; already {
+		// Never clobber an in-progress disable with a shorter one: a single 429
+		// (rate_limit, 1m) must not re-expose a model that is mid-transport-error
+		// cooldown (60m) or mid-escalated-blacklist. A permanent "unavailable"
+		// disable always wins.
+		if existing.reason == "unavailable" {
+			return
+		}
+		if !until.IsZero() && existing.until.After(until) {
+			return
+		}
+		h.disabledUntil[name] = disableInfo{until: until, reason: reason}
+		return
+	}
+
+	h.logger.Warn("model disabled", "model", name, "cooldown", cooldown, "reason", reason)
+	h.disabledUntil[name] = disableInfo{until: until, reason: reason}
 }
 
-// disableModelUpstream disables a specific model on a specific upstream.
+// parseModelKey splits "upstream/model" or "upstream/*" into components.
+func parseModelKey(key string) (upstream, model string) {
+	if idx := strings.Index(key, "/"); idx >= 0 {
+		return key[:idx], key[idx+1:]
+	}
+	return key, ""
+}
+
+// isConfiguredModel checks if the model is in the explicit preference list (cfg.Models).
+func (h *Handler) isConfiguredModel(upstreamName, modelName string) bool {
+	if modelName == "*" {
+		return true // upstream-wide disable is always configured
+	}
+	cfg := h.loadConfig()
+	for _, m := range cfg.Models {
+		if m.Upstream == upstreamName && m.Name == modelName {
+			return true
+		}
+	}
+	return false
+}
+
+// DisableModelUpstream temporarily disables a specific model on a specific upstream.
 // The key is "upstream/model" so the same model name on different upstreams
 // is tracked independently. reason should be "rate_limit" or "error".
+func (h *Handler) DisableModelUpstream(upstreamName, modelName, reason string) {
+	h.disableModelUpstream(upstreamName, modelName, reason)
+}
+
+// disableModelUpstream is the internal implementation.
 func (h *Handler) disableModelUpstream(upstreamName, modelName, reason string) {
 	h.disableModel(upstreamName+"/"+modelName, reason)
+}
+
+// DisableUpstream temporarily disables every model on an upstream. This is
+// used for provider-wide quota errors where trying another model cannot help.
+func (h *Handler) DisableUpstream(upstreamName, reason string) {
+	h.disableUpstream(upstreamName, reason)
+}
+
+// disableUpstream temporarily disables every model on an upstream. This is
+// used for provider-wide quota errors where trying another model cannot help.
+func (h *Handler) disableUpstream(upstreamName, reason string) {
+	h.disableModel(upstreamName+"/*", reason)
+}
+
+// trackRateLimit applies per-model rate-limit backoff for a 429 upstream
+// response. A global rate limit disables the whole upstream (trying another
+// model there cannot help); otherwise the model's consecutive-429 counter is
+// incremented and the model disabled for the short burst cooldown (1st 429) or
+// the long blacklist (2nd consecutive 429, "rate_limit_escalated"). It returns
+// the backoff scope ("upstream" or "model") and the updated retry count (0 for
+// a global limit), so callers can log consistently.
+//
+// This single method is shared by the streaming and non-streaming fallback
+// paths so their rate-limit handling cannot diverge again.
+func (h *Handler) trackRateLimit(upstream, model string, respBody []byte) (string, int) {
+	if errs.IsGlobalRateLimit(respBody) {
+		h.disableUpstream(upstream, "rate_limit")
+		return "upstream", 0
+	}
+	modelKey := upstream + "/" + model
+	h.disabledMu.Lock()
+	retries := h.rateLimitRetries[modelKey] + 1
+	h.rateLimitRetries[modelKey] = retries
+	h.disabledMu.Unlock()
+	if retries >= 2 {
+		// Second consecutive 429: blacklist the model for the long
+		// circuitBreakerCooldown rather than the 1-minute burst cooldown.
+		// rate_limit_escalated maps to that longer duration in disableModel and
+		// is still classified as rate limiting by allModelsDisabledByRateLimit.
+		h.DisableModelUpstream(upstream, model, "rate_limit_escalated")
+	} else {
+		// First 429: disable with the short cooldown so subsequent requests
+		// skip the model, while the current request falls through to the next.
+		h.DisableModelUpstream(upstream, model, "rate_limit")
+	}
+	return "model", retries
 }
 
 func (h *Handler) isModelDisabled(name string) bool {
@@ -254,6 +441,10 @@ func (h *Handler) isModelDisabled(name string) bool {
 	info, ok := h.disabledUntil[name]
 	if !ok {
 		return false
+	}
+	if info.reason == "unavailable" {
+		// Permanent: the upstream no longer serves this model.
+		return true
 	}
 	if time.Now().Before(info.until) {
 		return true
@@ -266,7 +457,22 @@ func (h *Handler) isModelDisabled(name string) bool {
 
 // isModelUpstreamDisabled checks if a model on a specific upstream is disabled.
 func (h *Handler) isModelUpstreamDisabled(upstreamName, modelName string) bool {
-	return h.isModelDisabled(upstreamName + "/" + modelName)
+	return h.isModelDisabled(upstreamName+"/*") || h.isModelDisabled(upstreamName+"/"+modelName)
+}
+
+// IsModelUpstreamUnavailable reports whether the upstream answered that the
+// model no longer exists. Such models are skipped and hidden from listings.
+func (h *Handler) IsModelUpstreamUnavailable(upstreamName, modelName string) bool {
+	h.disabledMu.Lock()
+	defer h.disabledMu.Unlock()
+	info, ok := h.disabledUntil[upstreamName+"/"+modelName]
+	return ok && info.reason == "unavailable"
+}
+
+// MarkModelUpstreamUnavailable permanently disables a model the upstream no
+// longer serves, so it is skipped from routing and hidden from listings.
+func (h *Handler) MarkModelUpstreamUnavailable(upstreamName, modelName string) {
+	h.DisableModelUpstream(upstreamName, modelName, "unavailable")
 }
 
 // allModelsDisabledByRateLimit checks if every model in the list was disabled
@@ -279,11 +485,25 @@ func (h *Handler) allModelsDisabledByRateLimit(specs []config.ModelSpec) bool {
 	defer h.disabledMu.Unlock()
 	for _, s := range specs {
 		info, ok := h.disabledUntil[s.Upstream+"/"+s.Name]
-		if !ok || info.reason != "rate_limit" {
+		if !ok {
+			info, ok = h.disabledUntil[s.Upstream+"/*"]
+		}
+		if !ok || (info.reason != "rate_limit" && info.reason != "rate_limit_escalated") {
 			return false
 		}
 	}
 	return true
+}
+
+// nextDifferentUpstream finds the next index in fallbackModels whose upstream
+// differs from the given upstream. Returns -1 if no such model exists.
+func (h *Handler) nextDifferentUpstream(models []config.ModelSpec, startIdx int, upstream string) int {
+	for j := startIdx + 1; j < len(models); j++ {
+		if models[j].Upstream != upstream {
+			return j
+		}
+	}
+	return -1
 }
 
 // HandleMessages handles POST /v1/messages and POST /v1/messages?beta=true
@@ -323,23 +543,36 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve model
 	originalModel := msgReq.Model
+	if h.loadConfig().DefaultModel == "" {
+		h.writeError(w, http.StatusServiceUnavailable, anthropic.ErrInternalError, "Model catalog is not ready")
+		return
+	}
 
 	// "custom" is the sentinel value set by ANTHROPIC_MODEL=custom in the
 	// banner.  It means "use whatever the proxy's default model is".
-	// The proxy ignores the client-requested model name and always routes to
-	// its own configured default model (the first entry in the ordered
-	// models list); the name Claude Code sends is not used. Any non-default
-	// name falls back to the default as well.
+	// If the client sends a specific model name that exists in our
+	// preference list, try it first; otherwise fall back to default.
 	resolvedModel := originalModel
-	if originalModel == "custom" || originalModel == "" || originalModel != h.loadConfig().DefaultModel {
-		if originalModel != "custom" && originalModel != "" {
-			h.logger.Warn("model not found, falling back to default",
+	cfg := h.loadConfig()
+	if originalModel == "custom" || originalModel == "" {
+		resolvedModel = cfg.DefaultModel
+	} else if originalModel != cfg.DefaultModel {
+		// Check if the requested model is in our effective models list.
+		requestedAllowed := false
+		for _, m := range cfg.EffectiveModels() {
+			if m.Name == originalModel {
+				requestedAllowed = true
+				break
+			}
+		}
+		if !requestedAllowed && !cfg.AllowUnlisted {
+			h.logger.Warn("model not in preference list, falling back to default",
 				"request_id", reqID,
 				"requested_model", originalModel,
-				"fallback_model", h.loadConfig().DefaultModel,
+				"fallback_model", cfg.DefaultModel,
 			)
+			resolvedModel = cfg.DefaultModel
 		}
-		resolvedModel = h.loadConfig().DefaultModel
 	}
 
 	// Route to reasoning/completion model if configured
@@ -388,20 +621,24 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 	// Build ordered list of models to try (deduplicated, preference order),
 	// skipping models disabled by the circuit breaker.
-	fallbackModels := h.buildPreferenceList(&config.ModelSpec{
+	preferenceModels := h.buildPreferenceList(&config.ModelSpec{
 		Name:     resolvedModel,
 		Upstream: h.loadConfig().UpstreamForModel(resolvedModel),
 	})
 	// Copy before filtering to avoid mutating the shared PrecomputedFallbacks slice.
-	usable := make([]config.ModelSpec, 0, len(fallbackModels))
-	for _, spec := range fallbackModels {
+	usable := make([]config.ModelSpec, 0, len(preferenceModels))
+	for _, spec := range preferenceModels {
 		if h.isModelUpstreamDisabled(spec.Upstream, spec.Name) {
 			h.logger.Debug("skipping disabled model", "model", spec.Name, "upstream", spec.Upstream)
 			continue
 		}
 		usable = append(usable, spec)
 	}
-	fallbackModels = usable
+	fallbackModels := usable
+	if len(fallbackModels) == 0 {
+		h.writePreferenceExhausted(w, reqID, preferenceModels)
+		return
+	}
 
 	// Forward to upstream
 	if msgReq.Stream {
@@ -415,9 +652,18 @@ func (h *Handler) handleNonStream(w http.ResponseWriter, r *http.Request, msgReq
 	ctx, cancel := context.WithTimeout(r.Context(), h.loadConfig().RequestTimeout)
 	defer cancel()
 	var maxRetryAfter *int
+	var lastConvertErr error
 
-	for i, spec := range fallbackModels {
+	// Indexed loop (not `for ... range`): the conversion-error branch below
+	// advances `i` directly (i = next - 1) to skip the remaining models on the
+	// same upstream, which only works with a manual index.
+	for i := 0; i < len(fallbackModels); i++ {
+		spec := fallbackModels[i]
 		msgReq.Model = spec.Name
+		if h.isModelUpstreamDisabled(spec.Upstream, spec.Name) {
+			h.logger.Debug("skipping newly disabled model", "model", spec.Name, "upstream", spec.Upstream)
+			continue
+		}
 
 		if i > 0 {
 			h.logger.Info("trying next model in preference order",
@@ -428,189 +674,94 @@ func (h *Handler) handleNonStream(w http.ResponseWriter, r *http.Request, msgReq
 			)
 		}
 
-		// Codex model: route through Codex client
-		if spec.Upstream == config.CodexUpstreamName {
-			if h.router.Codex() == nil {
-				h.logger.Warn("codex model but codex backend not configured, skipping",
-					"request_id", reqID, "model", spec.Name)
-				continue
-			}
-			codexReq, err := codex.TransformRequest(msgReq)
-			if err != nil {
-				h.logger.Warn("codex transform failed, skipping model",
-					"request_id", reqID, "model", spec.Name, "error", err.Error())
-				continue
-			}
-			reqBody, err := json.Marshal(codexReq)
-			if err != nil {
-				continue
-			}
-
-			upStart := time.Now()
-			resp, err := h.router.Codex().Do(ctx, "POST", codex.CodexPath, bytes.NewReader(reqBody))
-			if err != nil {
-				h.logger.Warn("codex upstream error, trying next model",
-					"request_id", reqID, "model", spec.Name, "error", err.Error())
-				continue
-			}
-			upLatency := time.Since(upStart)
-
-			if resp.StatusCode == 429 {
-				_ = resp.Body.Close()
-				retryAfter := anthropic.ParseRetryAfter(resp.Header)
-				h.logger.Warn("rate limited on model",
-					"request_id", reqID, "used_model", spec.Name,
-					"retry_after", retryAfter,
-					"has_more_fallbacks", i < len(fallbackModels)-1)
-				if retryAfter != nil {
-					if maxRetryAfter == nil || *retryAfter > *maxRetryAfter {
-						maxRetryAfter = retryAfter
-					}
-				}
-				h.disableModelUpstream(spec.Upstream, spec.Name, "rate_limit")
-				if i < len(fallbackModels)-1 {
-					continue
-				}
-				anthBody, anthStatus := anthropic.NewRateLimitResponse(429, "Rate limit exceeded on all models", maxRetryAfter)
-				w.Header().Set("Content-Type", "application/json")
-				if maxRetryAfter != nil {
-					w.Header().Set("Retry-After", strconv.Itoa(*maxRetryAfter))
-				}
-				w.WriteHeader(anthStatus)
-				_, _ = w.Write(anthBody)
-				tried := modelNames(fallbackModels)
-				h.logger.Info("all models in preference list exhausted",
-					"request_id", reqID, "tried_models", tried)
-				return
-			}
-
-			if resp.StatusCode >= 400 {
-				respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-				_ = resp.Body.Close()
-				h.logger.Warn("codex upstream error (non-stream)",
-					"request_id", reqID, "model", spec.Name,
-					"status", resp.StatusCode,
-
-					"has_more_fallbacks", i < len(fallbackModels)-1)
-				h.disableModelUpstream(spec.Upstream, spec.Name, "error")
-				if i < len(fallbackModels)-1 {
-					continue
-				}
-				anthBody, anthStatus := anthropic.UpstreamErrorToAnthropic(resp.StatusCode, string(respBody))
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(anthStatus)
-				_, _ = w.Write(anthBody)
-				return
-			}
-
-			// Success: parse Codex non-stream response. The Codex backend
-			// streams the output as response.output_item.done events and sends
-			// an (almost) empty response body in response.done/response.completed
-			// — the final body's "output" array is empty. Reassemble the output
-			// from the item events so text and tool-calls are not lost.
-			respBody, err := io.ReadAll(io.LimitReader(resp.Body, h.loadConfig().MaxBodySize+1))
-			_ = resp.Body.Close()
-			if err != nil {
-				continue
-			}
-			events := codex.ParseSSEEvents(respBody)
-			doneBody := codex.FindDoneBody(events)
-			if doneBody == nil || codex.IsFailedStatus(doneBody.Status) {
-				status := "none"
-				if doneBody != nil {
-					status = doneBody.Status
-				}
-				h.logger.Warn("codex non-stream: no usable response in Codex SSE, trying next model",
-					"request_id", reqID, "model", spec.Name, "status", status)
-				continue
-			}
-			// Reassemble output items from response.output_item.done events.
-			var outputItems []codex.OutputItem
-			for _, evt := range events {
-				if evt.Type == "response.output_item.done" && evt.Item != nil {
-					outputItems = append(outputItems, *evt.Item)
-				}
-			}
-			if len(outputItems) > 0 {
-				doneBody.Output = outputItems
-			}
-			anthResp := codex.TransformResponse(doneBody, originalModel)
-			anthRespBody, err := json.Marshal(anthResp)
-			if err != nil {
-				continue
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(anthRespBody)
-			latency := time.Since(start)
-			h.logger.Info("request completed",
-				"request_id", reqID, "status", http.StatusOK,
-				"upstream_latency", upLatency.String(), "latency", latency.String(),
-				"requested_model", originalModel, "used_model", spec.Name,
-				"preference_step", i, "stream", false)
-			return
-		}
-
-		// Regular model: route through the upstream that serves it.
-		client, err := h.router.ClientForModel(spec.Name, spec.Upstream)
-		if err != nil {
-			h.logger.Warn("no upstream for model, skipping",
-				"request_id", reqID, "model", spec.Name, "upstream", spec.Upstream, "error", err.Error())
+		provider := h.providerFor(spec)
+		if provider == nil {
+			h.logger.Warn("provider not configured, skipping",
+				"request_id", reqID, "model", spec.Name, "upstream", spec.Upstream)
 			continue
-		}
-
-		// Regular model: OpenAI Chat Completions path
-		oaiReq, err := convert.Request(msgReq, h.loadConfig().DefaultModel)
-		if err != nil {
-			h.writeError(w, http.StatusBadRequest, anthropic.ErrInvalidRequest, "Conversion error: "+err.Error())
-			return
-		}
-
-		reqBody, err := json.Marshal(oaiReq)
-		if err != nil {
-			h.writeError(w, http.StatusInternalServerError, anthropic.ErrInternalError, "Failed to marshal request")
-			return
 		}
 
 		upStart := time.Now()
-		resp, err := client.Do(ctx, "POST", "/chat/completions", bytes.NewReader(reqBody), authOverride...)
+		resp, err := provider.Invoke(ctx, msgReq, spec.Name, h.loadConfig().DefaultModel, false, authOverride...)
 		if err != nil {
+			if errors.Is(err, errs.ErrInvalidRequest) {
+				// The provider cannot encode this request. Every model on the
+				// same upstream shares the same converter, so further models on
+				// this upstream would fail identically — skip straight to the
+				// next upstream (e.g. Codex) instead of looping over every Zen
+				// fallback. Return the conversion error as a 400 only if no
+				// other upstream can be tried.
+				lastConvertErr = err
+				h.logger.Warn("provider cannot encode request, skipping remaining models on upstream",
+					"request_id", reqID, "model", spec.Name, "upstream", spec.Upstream, "error", err.Error())
+				next := h.nextDifferentUpstream(fallbackModels, i, spec.Upstream)
+				if next >= 0 {
+					i = next - 1 // loop increments
+					continue
+				}
+				h.writeError(w, http.StatusBadRequest, anthropic.ErrInvalidRequest, "Conversion error: "+lastConvertErr.Error())
+				return
+			}
+			if errors.Is(err, errs.ErrMarshal) {
+				h.writeError(w, http.StatusInternalServerError, anthropic.ErrInternalError, "Failed to marshal request")
+				return
+			}
 			h.logger.Warn("upstream transport error, trying next model",
 				"request_id", reqID, "model", spec.Name, "upstream", spec.Upstream,
 				"has_more_fallbacks", i < len(fallbackModels)-1, "error", err.Error())
-			h.disableModelUpstream(spec.Upstream, spec.Name, "error")
+			h.DisableModelUpstream(spec.Upstream, spec.Name, "error")
 			continue
 		}
-		respBody, err := io.ReadAll(io.LimitReader(resp.Body, h.loadConfig().MaxBodySize+1))
 		upLatency := time.Since(upStart)
 
-		if err != nil {
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, h.loadConfig().MaxBodySize+1))
+		if readErr != nil {
 			_ = resp.Body.Close()
 			h.writeError(w, http.StatusBadGateway, anthropic.ErrInternalError, "Failed to read upstream response")
 			return
 		}
 
 		if resp.StatusCode == 429 {
+			_ = resp.Body.Close()
 			retryAfter := anthropic.ParseRetryAfter(resp.Header)
+			retryAfterLog := "unknown"
+			if retryAfter != nil {
+				retryAfterLog = strconv.Itoa(*retryAfter)
+			}
+			scope, retries := h.trackRateLimit(spec.Upstream, spec.Name, respBody)
+			if retries >= 2 {
+				h.logger.Warn("rate limit retry limit reached, blacklisting model",
+					"request_id", reqID,
+					"model", spec.Name,
+					"upstream", spec.Upstream,
+					"retries", retries,
+					"cooldown", circuitBreakerCooldown,
+				)
+			} else if retries == 1 {
+				h.logger.Debug("rate limit hit, disabling model for short cooldown",
+					"request_id", reqID,
+					"model", spec.Name,
+					"upstream", spec.Upstream,
+					"retries", retries,
+				)
+			}
 			h.logger.Warn("rate limited on model",
 				"request_id", reqID,
 				"used_model", spec.Name,
-				"retry_after", retryAfter,
+				"retry_after_seconds", retryAfterLog,
+				"scope", scope,
 				"has_more_fallbacks", i < len(fallbackModels)-1,
 			)
-			h.disableModelUpstream(spec.Upstream, spec.Name, "rate_limit")
-			// Track max Retry-After across all attempts
+			// Track max Retry-After across all attempts.
 			if retryAfter != nil {
 				if maxRetryAfter == nil || *retryAfter > *maxRetryAfter {
 					maxRetryAfter = retryAfter
 				}
 			}
-			// Try next fallback model
 			if i < len(fallbackModels)-1 {
-				_ = resp.Body.Close()
 				continue
 			}
-			// All models exhausted — return 429 with Retry-After
+			// All models exhausted — return 429 with Retry-After.
 			anthBody, anthStatus := anthropic.NewRateLimitResponse(429, "Rate limit exceeded on all models", maxRetryAfter)
 			w.Header().Set("Content-Type", "application/json")
 			if maxRetryAfter != nil {
@@ -620,10 +771,7 @@ func (h *Handler) handleNonStream(w http.ResponseWriter, r *http.Request, msgReq
 			_, _ = w.Write(anthBody)
 			tried := modelNames(fallbackModels)
 			h.logger.Info("all models in preference list exhausted",
-				"request_id", reqID,
-				"tried_models", tried,
-			)
-			_ = resp.Body.Close()
+				"request_id", reqID, "tried_models", tried)
 			return
 		}
 
@@ -634,12 +782,12 @@ func (h *Handler) handleNonStream(w http.ResponseWriter, r *http.Request, msgReq
 				"status", resp.StatusCode,
 				"has_more_fallbacks", i < len(fallbackModels)-1,
 			)
-			h.disableModelUpstream(spec.Upstream, spec.Name, "error")
+			h.DisableModelUpstream(spec.Upstream, spec.Name, "error")
 			_ = resp.Body.Close()
 			if i < len(fallbackModels)-1 {
 				continue
 			}
-			// All models exhausted — return the last error
+			// All models exhausted — return the last error.
 			anthBody, anthStatus := anthropic.UpstreamErrorToAnthropic(resp.StatusCode, string(respBody))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(anthStatus)
@@ -648,39 +796,78 @@ func (h *Handler) handleNonStream(w http.ResponseWriter, r *http.Request, msgReq
 		}
 
 		if resp.StatusCode >= 400 {
+			// A 5xx (other than 502/503/504 handled above) is still transient —
+			// never mark a model permanently unavailable on a server error.
+			if resp.StatusCode < 500 && errs.IsModelUnavailable(respBody) {
+				h.MarkModelUpstreamUnavailable(spec.Upstream, spec.Name)
+				h.logger.Warn("model no longer available on upstream, skipping (hidden)",
+					"request_id", reqID,
+					"model", spec.Name,
+					"upstream", spec.Upstream,
+					"upstream_status", resp.StatusCode,
+					"has_more_fallbacks", i < len(fallbackModels)-1,
+				)
+				_ = resp.Body.Close()
+				if i < len(fallbackModels)-1 {
+					continue
+				}
+				// Every model is unavailable — return the last error.
+				anthBody, anthStatus := anthropic.UpstreamErrorToAnthropic(resp.StatusCode, string(respBody))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(anthStatus)
+				_, _ = w.Write(anthBody)
+				h.logger.Info("all models in preference list exhausted",
+					"request_id", reqID,
+					"tried_models", modelNames(fallbackModels),
+				)
+				return
+			}
 			anthBody, anthStatus := anthropic.UpstreamErrorToAnthropic(resp.StatusCode, string(respBody))
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(anthStatus)
-			_, _ = w.Write(anthBody)
-			h.logger.Info("upstream error",
+			h.logger.Info("upstream client error, trying next model",
 				"request_id", reqID,
 				"upstream_status", resp.StatusCode,
 				"model", spec.Name,
 				"upstream_latency", upLatency.String(),
+				"has_more_fallbacks", i < len(fallbackModels)-1,
 			)
 			_ = resp.Body.Close()
+			if i < len(fallbackModels)-1 {
+				continue
+			}
+			// All models exhausted — return the last 4xx error.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(anthStatus)
+			_, _ = w.Write(anthBody)
+			h.logger.Info("all models in preference list exhausted",
+				"request_id", reqID,
+				"tried_models", modelNames(fallbackModels),
+			)
 			return
 		}
 
-		// Success — parse and return
-		var oaiResp openai.ChatCompletionResponse
-		if err := json.Unmarshal(respBody, &oaiResp); err != nil {
-			_ = resp.Body.Close()
+		// Success — decode through the provider.
+		h.clearRateLimitRetry(spec.Upstream + "/" + spec.Name)
+		anthBody, parseErr := provider.ParseResponse(spec.Name, respBody, originalModel)
+		_ = resp.Body.Close()
+		if parseErr != nil {
+			if errors.Is(parseErr, errs.ErrNoContent) {
+				h.logger.Warn("no usable response from provider, trying next model",
+					"request_id", reqID, "model", spec.Name, "upstream", spec.Upstream)
+				continue
+			}
+			if errors.Is(parseErr, errs.ErrFailed) {
+				h.logger.Warn("provider response reported a failure, trying next model",
+					"request_id", reqID, "model", spec.Name, "upstream", spec.Upstream)
+				h.DisableModelUpstream(spec.Upstream, spec.Name, "error")
+				continue
+			}
 			h.writeError(w, http.StatusBadGateway, anthropic.ErrInternalError, "Invalid upstream response")
-			return
-		}
-
-		anthResp := convert.Response(&oaiResp, originalModel)
-		anthRespBody, err := json.Marshal(anthResp)
-		if err != nil {
-			_ = resp.Body.Close()
-			h.writeError(w, http.StatusInternalServerError, anthropic.ErrInternalError, "Failed to marshal response")
 			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(anthRespBody)
+		_, _ = w.Write(anthBody)
 
 		latency := time.Since(start)
 		h.logger.Info("request completed",
@@ -693,7 +880,6 @@ func (h *Handler) handleNonStream(w http.ResponseWriter, r *http.Request, msgReq
 			"preference_step", i,
 			"stream", false,
 		)
-		_ = resp.Body.Close()
 		return
 	}
 
@@ -710,7 +896,11 @@ func (h *Handler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	modelsList := make([]models.ModelEntry, 0, len(h.loadConfig().EffectiveModels()))
 	seen := make(map[string]bool)
 	for _, spec := range h.loadConfig().EffectiveModels() {
-		if spec.Upstream == config.CodexUpstreamName && h.router.Codex() == nil {
+		if h.providerFor(spec) == nil {
+			continue
+		}
+		if h.IsModelUpstreamUnavailable(spec.Upstream, spec.Name) {
+			// The upstream no longer serves this model — hide it.
 			continue
 		}
 		if !seen[spec.Name] {
@@ -720,14 +910,20 @@ func (h *Handler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.loadConfig().ExposeAllModels {
 		for _, model := range h.catalog.GetModels(false) {
-			if !seen[model.ID] {
+			if config.IsOpenCodeModelSupported(model.ID) && !seen[model.ID] {
 				modelsList = append(modelsList, model)
 				seen[model.ID] = true
 			}
 		}
+		for _, model := range h.DiscoveredCodexModels() {
+			if !seen[model.Slug] {
+				modelsList = append(modelsList, models.ModelEntry{ID: model.Slug, Object: "model", OwnedBy: config.CodexUpstreamName})
+				seen[model.Slug] = true
+			}
+		}
 	}
 
-	resp := models.ToResponse(modelsList, h.loadConfig().UpstreamBaseURL)
+	resp := models.ToResponse(modelsList, h.loadConfig().ZenBaseURL)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -764,23 +960,14 @@ func (h *Handler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	primary := effective[0]
-	var err error
-	if primary.Upstream == config.CodexUpstreamName {
-		client := h.router.Codex()
-		if client == nil {
-			err = errors.New("codex backend not configured")
-		} else {
-			err = client.CheckModel(ctx, primary.Name)
-		}
+	p := h.providerFor(primary)
+	var checkErr error
+	if p == nil {
+		checkErr = errors.New("no provider configured for upstream " + primary.Upstream)
 	} else {
-		client, clientErr := h.router.ClientForModel(primary.Name, primary.Upstream)
-		if clientErr != nil {
-			err = clientErr
-		} else {
-			err = client.Check(ctx)
-		}
+		checkErr = p.Check(ctx, primary.Name, GetPassthroughKey(r))
 	}
-	if err != nil {
+	if checkErr != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte(`{"status":"not_ready","error":"upstream unreachable"}`))
@@ -821,11 +1008,12 @@ func (h *Handler) writeError(w http.ResponseWriter, status int, errType, message
 	_, _ = w.Write(body)
 }
 
-func (h *Handler) codexClient() *upstream.CodexClient {
-	if h.router == nil {
+func (h *Handler) codexClient() providers.Provider {
+	reg := h.loadRouter()
+	if reg == nil {
 		return nil
 	}
-	return h.router.Codex()
+	return reg.Codex()
 }
 
 func (h *Handler) writePreferenceExhausted(w http.ResponseWriter, reqID string, specs []config.ModelSpec) {
@@ -864,10 +1052,11 @@ func modelNames(specs []config.ModelSpec) []string {
 // resolved the request to a distinct routing model (e.g. a ReasoningModel),
 // that model is tried first, followed by the configured list.
 func (h *Handler) buildPreferenceList(primary *config.ModelSpec) []config.ModelSpec {
-	configured := h.loadConfig().PrecomputedFallbacks
+	cfg := h.loadConfig()
+	configured := cfg.PrecomputedFallbacks
 
 	if primary == nil {
-		primary = &config.ModelSpec{Name: h.loadConfig().DefaultModel, Upstream: config.DefaultUpstreamName}
+		primary = &config.ModelSpec{Name: cfg.DefaultModel, Upstream: config.DefaultUpstreamName}
 	}
 
 	if len(configured) == 0 {
@@ -891,6 +1080,9 @@ func (h *Handler) buildPreferenceList(primary *config.ModelSpec) []config.ModelS
 
 	// If the resolved model already leads the list, use it as-is.
 	if configured[0].Name == primary.Name && configured[0].Upstream == primary.Upstream {
+		if !cfg.OnlyPreferredModels {
+			return h.appendDiscoveredModels(configured, primary, codexAvailable)
+		}
 		return configured
 	}
 
@@ -903,6 +1095,39 @@ func (h *Handler) buildPreferenceList(primary *config.ModelSpec) []config.ModelS
 		if !seen[m.Name] {
 			list = append(list, m)
 			seen[m.Name] = true
+		}
+	}
+	if !cfg.OnlyPreferredModels {
+		return h.appendDiscoveredModels(list, primary, codexAvailable)
+	}
+	return list
+}
+
+// appendDiscoveredModels adds discovered Zen and Codex models as additional
+// fallbacks when OnlyPreferredModels is false.
+func (h *Handler) appendDiscoveredModels(list []config.ModelSpec, primary *config.ModelSpec, codexAvailable bool) []config.ModelSpec {
+	seen := make(map[string]bool, len(list))
+	for _, m := range list {
+		seen[m.Name] = true
+	}
+
+	// Add discovered free Zen models from catalog.
+	if h.catalog != nil {
+		for _, m := range models.FilteredModels(h.catalog.CachedModels()) {
+			if config.IsOpenCodeModelSupported(m.ID) && !config.IsOpenCodeContributorFree(m.ID) && !seen[m.ID] {
+				list = append(list, config.ModelSpec{Name: m.ID, Upstream: config.DefaultUpstreamName})
+				seen[m.ID] = true
+			}
+		}
+	}
+
+	// Add discovered Codex models.
+	if codexAvailable {
+		for _, model := range h.DiscoveredCodexModels() {
+			if !seen[model.Slug] {
+				list = append(list, config.ModelSpec{Name: model.Slug, Upstream: config.CodexUpstreamName})
+				seen[model.Slug] = true
+			}
 		}
 	}
 	return list

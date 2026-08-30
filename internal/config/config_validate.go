@@ -8,17 +8,17 @@ import (
 
 func (c *Config) Validate() []string {
 	var issues []string
-	if c.UpstreamBaseURL == "" {
-		issues = append(issues, "upstream_base_url is required")
+	if c.ZenBaseURL == "" {
+		issues = append(issues, "zen_base_url is required")
 	}
-	if len(c.Models) == 0 {
+	if len(c.Models) == 0 && strings.TrimRight(c.ZenBaseURL, "/") != OpenCodeBaseURL {
 		issues = append(issues, "at least one model is required (set the ordered models list, 1st = default)")
 	}
 	if c.ListenAddr == "" {
 		issues = append(issues, "listen_addr is required")
 	}
-	if !validHTTPURL(c.UpstreamBaseURL) {
-		issues = append(issues, "upstream_base_url must be an absolute HTTP(S) URL")
+	if !validHTTPURL(c.ZenBaseURL) {
+		issues = append(issues, "zen_base_url must be an absolute HTTP(S) URL")
 	}
 	if c.RequestTimeout <= 0 {
 		issues = append(issues, "request_timeout must be positive")
@@ -35,15 +35,13 @@ func (c *Config) Validate() []string {
 	if c.LogFormat != "text" && c.LogFormat != "json" {
 		issues = append(issues, "log_format must be text or json")
 	}
-	if c.PassthroughAPIKey && c.UpstreamAPIKey != "" && c.UpstreamAPIKey != "public" {
-		issues = append(issues, "UPSTREAM_API_KEY_PASSTHROUGH=true cannot be combined with a non-default UPSTREAM_API_KEY")
+	if usesOpenCodeZen(c) && !c.PassthroughAPIKey && (c.ZenAPIKey == "" || c.ZenAPIKey == "public") {
+		issues = append(issues, "zen_api_key is required for OpenCode Zen routes; set ZEN_API_KEY/--zen-key or enable passthrough")
 	}
-	if c.PassthroughAPIKey {
-		for _, u := range c.Upstreams {
-			if u.APIKey != "" && u.APIKey != "public" {
-				issues = append(issues, "UPSTREAM_API_KEY_PASSTHROUGH=true cannot be combined with an API key for upstream "+u.Name)
-			}
-		}
+	// When passthrough is enabled for OpenCode Zen, a service key is still required
+	// for model discovery and health checks; the caller provides the per-request key.
+	if usesOpenCodeZen(c) && c.PassthroughAPIKey && (c.ZenAPIKey == "" || c.ZenAPIKey == "public") {
+		issues = append(issues, "zen_api_key is required for OpenCode Zen routes even with passthrough enabled (used for model discovery and health checks)")
 	}
 	if (c.CodexOAuthToken == "") != (c.CodexAccountID == "") {
 		issues = append(issues, "codex_oauth_token and codex_account_id must both be set or both be empty")
@@ -81,16 +79,39 @@ func (c *Config) Validate() []string {
 	return issues
 }
 
+func usesOpenCodeZen(c *Config) bool {
+	if strings.TrimRight(c.ZenBaseURL, "/") != OpenCodeBaseURL {
+		return false
+	}
+	if c.ExposeAllModels {
+		return true
+	}
+	if len(c.EffectiveModels()) == 0 {
+		return true
+	}
+	for _, model := range c.EffectiveModels() {
+		if model.Upstream == DefaultUpstreamName {
+			return true
+		}
+	}
+	for _, model := range []string{c.ReasoningModel, c.CompletionModel} {
+		if model != "" && c.UpstreamForModel(model) == DefaultUpstreamName {
+			return true
+		}
+	}
+	return false
+}
+
 func validHTTPURL(raw string) bool {
 	u, err := url.Parse(raw)
 	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
 func (c *Config) MaskedKey() string {
-	if c.UpstreamAPIKey == "" {
+	if c.ZenAPIKey == "" {
 		return ""
 	}
-	k := c.UpstreamAPIKey
+	k := c.ZenAPIKey
 	if len(k) <= 8 {
 		return "***"
 	}
@@ -101,8 +122,8 @@ func (c *Config) String() string {
 	var b strings.Builder
 	b.WriteString("Config{\n")
 	fmt.Fprintf(&b, "  ListenAddr: %s\n", c.ListenAddr)
-	fmt.Fprintf(&b, "  UpstreamBaseURL: %s\n", c.UpstreamBaseURL)
-	fmt.Fprintf(&b, "  UpstreamAPIKey: %s\n", c.MaskedKey())
+	fmt.Fprintf(&b, "  ZenBaseURL: %s\n", c.ZenBaseURL)
+	fmt.Fprintf(&b, "  ZenAPIKey: %s\n", c.MaskedKey())
 	fmt.Fprintf(&b, "  InboundAPIKey: %s\n", boolStr(c.InboundAPIKey != "", "***", "(none)"))
 	fmt.Fprintf(&b, "  PassthroughAPIKey: %v\n", c.PassthroughAPIKey)
 	fmt.Fprintf(&b, "  DefaultModel: %s\n", c.DefaultModel)

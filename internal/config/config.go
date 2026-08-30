@@ -10,13 +10,25 @@ import (
 	"time"
 )
 
-// OpenCodeBaseURL is the default upstream: OpenCode's free model endpoint.
-// Models there are free and can be extended with others, so it is the default.
-// The upstream remains overridable (flag/env/file) for OpenRouter, OpenAI, etc.
+// OpenCodeBaseURL is the default upstream: OpenCode's free model endpoint
+// (Zen). Models there are free and can be extended with others, so it is the
+// default. The URL remains overridable (flag/env/file) for OpenRouter, OpenAI,
+// etc.
 const OpenCodeBaseURL = "https://opencode.ai/zen/v1"
 
-// DefaultUpstreamName is the canonical name for the built-in OpenCode upstream.
-const DefaultUpstreamName = "opencode"
+// OpenCodeMuseSparkContributorFree uses Zen's Responses API rather than the
+// OpenAI-compatible Chat Completions endpoint used by the other free models.
+// It is excluded from automatic discovery (see IsOpenCodeContributorFree) and
+// must be listed explicitly.
+const OpenCodeMuseSparkContributorFree = "muse-spark-1.2-contributor-free"
+
+// DefaultUpstreamName is the canonical name for the built-in Zen upstream.
+const DefaultUpstreamName = "zen"
+
+// LegacyOpenCodeUpstreamName is accepted as an alias for DefaultUpstreamName
+// so older model lists using "@opencode" keep working. It is normalized to
+// "zen" during Precompute.
+const LegacyOpenCodeUpstreamName = "opencode"
 
 // CodexUpstreamName is the canonical name for the ChatGPT Codex backend.
 const CodexUpstreamName = "codex"
@@ -30,7 +42,7 @@ type UpstreamConfig struct {
 
 // ModelSpec is a single entry in the ordered model preference list.
 // Name is the upstream model name; Upstream is the upstream that serves it
-// ("opencode" for the built-in default, "codex" for the ChatGPT backend,
+// ("zen" for the built-in default, "codex" for the ChatGPT backend,
 // or the Name of an entry in Upstreams).
 type ModelSpec struct {
 	Name     string `json:"name"`
@@ -39,7 +51,7 @@ type ModelSpec struct {
 
 // ModelSpecs is a []ModelSpec that also accepts a legacy JSON form where the
 // models are a plain array of strings (e.g. ["big-pickle","gpt-5.6-terra"]).
-// In that case each string is treated as ModelSpec{Name: s, Upstream: "opencode"}.
+// In that case each string is treated as ModelSpec{Name: s, Upstream: "zen"}.
 type ModelSpecs []ModelSpec
 
 // UnmarshalJSON supports both [{"name":..,"upstream":..}, ...] and ["name", ...].
@@ -68,22 +80,23 @@ type Config struct {
 	ListenAddr string
 	ConfigFile string // Path to config file (--config flag)
 
-	// Upstream
-	UpstreamBaseURL string
-	UpstreamAPIKey  string
-	Upstreams       []UpstreamConfig // Additional OpenAI-compatible upstreams
+	// Upstream (built-in "zen" upstream)
+	ZenBaseURL string
+	ZenAPIKey  string           // OpenCode Zen API key for the built-in zen upstream
+	Upstreams  []UpstreamConfig // Additional OpenAI-compatible upstreams
 
 	// Auth
 	InboundAPIKey     string
 	PassthroughAPIKey bool
 
 	// Models
-	DefaultModel    string // Derived in Precompute from Models[0].Name (1st = default).
-	ReasoningModel  string
-	CompletionModel string
-	Models          []ModelSpec // Single ordered preference list. 1st = default, rest = ordered fallbacks.
-	AllowUnlisted   bool
-	ExposeAllModels bool
+	DefaultModel        string // Derived in Precompute from Models[0].Name (1st = default).
+	ReasoningModel      string
+	CompletionModel     string
+	Models              []ModelSpec // Single ordered preference list. 1st = default, rest = ordered fallbacks.
+	AllowUnlisted       bool
+	ExposeAllModels     bool
+	OnlyPreferredModels bool // If true, do not fall back to discovered models after preference list is exhausted.
 
 	// Timeouts
 	RequestTimeout time.Duration
@@ -117,8 +130,8 @@ type Config struct {
 func DefaultConfig() *Config {
 	cfg := &Config{
 		ListenAddr:      "127.0.0.1:3000",
-		UpstreamBaseURL: OpenCodeBaseURL,
-		UpstreamAPIKey:  "public",
+		ZenBaseURL:      OpenCodeBaseURL,
+		ZenAPIKey:       "",
 		InboundAPIKey:   "",
 		AllowUnlisted:   false,
 		ExposeAllModels: false,
@@ -133,17 +146,9 @@ func DefaultConfig() *Config {
 		CodexRefreshToken: "",
 		Sources:           make(map[string]string),
 	}
-	// `Models` is the single ordered preference list (1st = default, the
-	// rest are fallbacks in priority order). DefaultModel is derived from
-	// Models[0] in Precompute(); there is no separate fallback field.
-	cfg.Models = []ModelSpec{
-		{Name: "big-pickle", Upstream: DefaultUpstreamName},
-		{Name: "deepseek-v4-flash-free", Upstream: DefaultUpstreamName},
-		{Name: "hy3-free", Upstream: DefaultUpstreamName},
-		{Name: "mimo-v2.5-free", Upstream: DefaultUpstreamName},
-		{Name: "nemotron-3-ultra-free", Upstream: DefaultUpstreamName},
-		{Name: "north-mini-code-free", Upstream: DefaultUpstreamName},
-	}
+	// An empty model list means "discover the current free Zen catalog". An
+	// explicit list remains the ordered routing contract for custom and Codex
+	// routes or for users who want a fixed preference order.
 	cfg.Precompute()
 	return cfg
 }
@@ -151,31 +156,34 @@ func DefaultConfig() *Config {
 type FileConfig struct {
 	ListenPort      string `json:"listen_port"`
 	ListenAddr      string `json:"listen_addr,omitempty"`
-	UpstreamBaseURL string `json:"upstream_base_url"`
-	UpstreamAPIKey  string `json:"upstream_api_key"`
+	ZenBaseURL      string `json:"zen_base_url"`
+	ZenAPIKey       string `json:"zen_api_key"`
+	UpstreamBaseURL string `json:"upstream_base_url"` // deprecated alias for zen_base_url
+	UpstreamAPIKey  string `json:"upstream_api_key"`  // deprecated alias for zen_api_key
 	InboundAPIKey   string `json:"inbound_api_key"`
 	PassthroughKey  *bool  `json:"passthrough_api_key"`
 	// Deprecated, read-only for migration of legacy config files. The
 	// ordered `models` list below is the single source of truth: its first
 	// entry is the default and the rest are fallbacks in priority order.
-	DefaultModel      string           `json:"default_model,omitempty"`
-	ReasoningModel    string           `json:"reasoning_model"`
-	CompletionModel   string           `json:"completion_model"`
-	FallbackModels    []string         `json:"fallback_models,omitempty"`
-	Models            ModelSpecs       `json:"models"`
-	Upstreams         []UpstreamConfig `json:"upstreams"`
-	AllowUnlisted     *bool            `json:"allow_unlisted_models"`
-	ExposeAllModels   *bool            `json:"expose_all_models"`
-	RequestTimeout    string           `json:"request_timeout"`
-	ModelCacheTTL     string           `json:"model_cache_ttl"`
-	MaxBodySize       *int64           `json:"max_body_size"`
-	LogLevel          string           `json:"log_level"`
-	LogFormat         string           `json:"log_format"`
-	CodexOAuthToken   string           `json:"codex_oauth_token"`
-	CodexAccountID    string           `json:"codex_account_id"`
-	CodexRefreshToken string           `json:"codex_refresh_token"`
-	WebInterfacePort  string           `json:"web_interface_port"`
-	WebInterfaceKey   string           `json:"web_interface_key"`
+	DefaultModel        string           `json:"default_model,omitempty"`
+	ReasoningModel      string           `json:"reasoning_model"`
+	CompletionModel     string           `json:"completion_model"`
+	FallbackModels      []string         `json:"fallback_models,omitempty"`
+	Models              ModelSpecs       `json:"models"`
+	Upstreams           []UpstreamConfig `json:"upstreams"`
+	AllowUnlisted       *bool            `json:"allow_unlisted_models"`
+	ExposeAllModels     *bool            `json:"expose_all_models"`
+	OnlyPreferredModels *bool            `json:"only_preferred_models"`
+	RequestTimeout      string           `json:"request_timeout"`
+	ModelCacheTTL       string           `json:"model_cache_ttl"`
+	MaxBodySize         *int64           `json:"max_body_size"`
+	LogLevel            string           `json:"log_level"`
+	LogFormat           string           `json:"log_format"`
+	CodexOAuthToken     string           `json:"codex_oauth_token"`
+	CodexAccountID      string           `json:"codex_account_id"`
+	CodexRefreshToken   string           `json:"codex_refresh_token"`
+	WebInterfacePort    string           `json:"web_interface_port"`
+	WebInterfaceKey     string           `json:"web_interface_key"`
 }
 
 func Load(args []string) (*Config, error) {
@@ -186,8 +194,10 @@ func Load(args []string) (*Config, error) {
 	var (
 		configFile      string
 		listenAddr      string
-		upstreamURL     string
-		upstreamKey     string
+		zenBaseURL      string
+		upstreamURL     string // deprecated alias for --zen-base-url
+		zenKey          string
+		upstreamKey     string // deprecated alias for --zen-key
 		inboundKey      string
 		passthroughKey  bool
 		reasoningModel  string
@@ -209,8 +219,10 @@ func Load(args []string) (*Config, error) {
 
 	fs.StringVar(&configFile, "config", "", "path to config file (JSON)")
 	fs.StringVar(&listenAddr, "listen", "", "listen address")
-	fs.StringVar(&upstreamURL, "upstream", "", "upstream base URL")
-	fs.StringVar(&upstreamKey, "upstream-key", "", "upstream API key")
+	fs.StringVar(&zenBaseURL, "zen-base-url", "", "OpenCode Zen base URL for the built-in zen upstream")
+	fs.StringVar(&upstreamURL, "upstream", "", "deprecated alias for --zen-base-url")
+	fs.StringVar(&zenKey, "zen-key", "", "OpenCode Zen API key for the built-in zen upstream")
+	fs.StringVar(&upstreamKey, "upstream-key", "", "deprecated alias for --zen-key")
 	fs.StringVar(&inboundKey, "inbound-key", "", "inbound API key for auth")
 	fs.BoolVar(&passthroughKey, "passthrough-key", false, "forward inbound API key to upstream")
 	fs.StringVar(&reasoningModel, "reasoning-model", "", "model for extended thinking requests")
@@ -266,13 +278,19 @@ func Load(args []string) (*Config, error) {
 		cfg.ListenAddr = listenAddr
 		cfg.setSource("listen_addr", "--listen")
 	}
-	if upstreamURL != "" {
-		cfg.UpstreamBaseURL = upstreamURL
-		cfg.setSource("upstream_base_url", "--upstream")
+	if zenBaseURL != "" {
+		cfg.ZenBaseURL = zenBaseURL
+		cfg.setSource("zen_base_url", "--zen-base-url")
+	} else if upstreamURL != "" {
+		cfg.ZenBaseURL = upstreamURL
+		cfg.setSource("zen_base_url", "--upstream (deprecated)")
 	}
-	if upstreamKey != "" {
-		cfg.UpstreamAPIKey = upstreamKey
-		cfg.setSource("upstream_api_key", "--upstream-key")
+	if zenKey != "" {
+		cfg.ZenAPIKey = zenKey
+		cfg.setSource("zen_api_key", "--zen-key")
+	} else if upstreamKey != "" {
+		cfg.ZenAPIKey = upstreamKey
+		cfg.setSource("zen_api_key", "--upstream-key (deprecated)")
 	}
 	if inboundKey != "" {
 		cfg.InboundAPIKey = inboundKey
@@ -381,13 +399,19 @@ func loadFile(path string, cfg *Config) error {
 		cfg.ListenAddr = fc.ListenAddr
 		cfg.setSource("listen_addr", path)
 	}
-	if fc.UpstreamBaseURL != "" {
-		cfg.UpstreamBaseURL = fc.UpstreamBaseURL
-		cfg.setSource("upstream_base_url", path)
+	if fc.ZenBaseURL != "" {
+		cfg.ZenBaseURL = fc.ZenBaseURL
+		cfg.setSource("zen_base_url", path)
+	} else if fc.UpstreamBaseURL != "" {
+		cfg.ZenBaseURL = fc.UpstreamBaseURL
+		cfg.setSource("zen_base_url", path+" (upstream_base_url, deprecated)")
 	}
-	if fc.UpstreamAPIKey != "" {
-		cfg.UpstreamAPIKey = fc.UpstreamAPIKey
-		cfg.setSource("upstream_api_key", path)
+	if fc.ZenAPIKey != "" {
+		cfg.ZenAPIKey = fc.ZenAPIKey
+		cfg.setSource("zen_api_key", path)
+	} else if fc.UpstreamAPIKey != "" {
+		cfg.ZenAPIKey = fc.UpstreamAPIKey
+		cfg.setSource("zen_api_key", path+" (upstream_api_key, deprecated)")
 	}
 	if fc.InboundAPIKey != "" {
 		cfg.InboundAPIKey = fc.InboundAPIKey
@@ -432,6 +456,10 @@ func loadFile(path string, cfg *Config) error {
 	if fc.ExposeAllModels != nil {
 		cfg.ExposeAllModels = *fc.ExposeAllModels
 		cfg.setSource("expose_all_models", path)
+	}
+	if fc.OnlyPreferredModels != nil {
+		cfg.OnlyPreferredModels = *fc.OnlyPreferredModels
+		cfg.setSource("only_preferred_models", path)
 	}
 	if fc.RequestTimeout != "" {
 		d, err := time.ParseDuration(fc.RequestTimeout)
@@ -486,7 +514,7 @@ func loadFile(path string, cfg *Config) error {
 
 // ParseModels parses a --models / MODELS value. It accepts:
 //   - JSON: an array of objects [{"name","upstream"}] or an array of strings ["a","b"]
-//   - a comma-separated list of "name@upstream" entries (bare "name" => upstream "opencode")
+//   - a comma-separated list of "name@upstream" entries (bare "name" => upstream "zen")
 func ParseModels(s string) ([]ModelSpec, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -542,13 +570,19 @@ func loadEnv(cfg *Config) {
 		cfg.ListenAddr = v
 		cfg.setSource("listen_addr", "LISTEN_ADDR")
 	}
-	if v := os.Getenv("UPSTREAM_BASE_URL"); v != "" {
-		cfg.UpstreamBaseURL = v
-		cfg.setSource("upstream_base_url", "UPSTREAM_BASE_URL")
+	if v := os.Getenv("ZEN_BASE_URL"); v != "" {
+		cfg.ZenBaseURL = v
+		cfg.setSource("zen_base_url", "ZEN_BASE_URL")
+	} else if v := os.Getenv("UPSTREAM_BASE_URL"); v != "" {
+		cfg.ZenBaseURL = v
+		cfg.setSource("zen_base_url", "UPSTREAM_BASE_URL (deprecated)")
 	}
-	if v := os.Getenv("UPSTREAM_API_KEY"); v != "" {
-		cfg.UpstreamAPIKey = v
-		cfg.setSource("upstream_api_key", "UPSTREAM_API_KEY")
+	if v := os.Getenv("ZEN_API_KEY"); v != "" {
+		cfg.ZenAPIKey = v
+		cfg.setSource("zen_api_key", "ZEN_API_KEY")
+	} else if v := os.Getenv("UPSTREAM_API_KEY"); v != "" {
+		cfg.ZenAPIKey = v
+		cfg.setSource("zen_api_key", "UPSTREAM_API_KEY (deprecated)")
 	}
 	if v := os.Getenv("INBOUND_API_KEY"); v != "" {
 		cfg.InboundAPIKey = v
@@ -591,6 +625,10 @@ func loadEnv(cfg *Config) {
 	if v := os.Getenv("EXPOSE_ALL_MODELS"); v != "" {
 		cfg.ExposeAllModels = parseBool(v)
 		cfg.setSource("expose_all_models", "EXPOSE_ALL_MODELS")
+	}
+	if v := os.Getenv("ONLY_PREFERRED_MODELS"); v != "" {
+		cfg.OnlyPreferredModels = parseBool(v)
+		cfg.setSource("only_preferred_models", "ONLY_PREFERRED_MODELS")
 	}
 	if v := os.Getenv("REQUEST_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -656,8 +694,8 @@ func parseBool(s string) bool {
 
 func (c *Config) TrimSpace() {
 	c.ListenAddr = strings.TrimSpace(c.ListenAddr)
-	c.UpstreamBaseURL = strings.TrimSpace(c.UpstreamBaseURL)
-	c.UpstreamAPIKey = strings.TrimSpace(c.UpstreamAPIKey)
+	c.ZenBaseURL = strings.TrimSpace(c.ZenBaseURL)
+	c.ZenAPIKey = strings.TrimSpace(c.ZenAPIKey)
 	c.InboundAPIKey = strings.TrimSpace(c.InboundAPIKey)
 	c.LogLevel = strings.TrimSpace(c.LogLevel)
 	c.LogFormat = strings.TrimSpace(c.LogFormat)

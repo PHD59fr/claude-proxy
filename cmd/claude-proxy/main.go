@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -17,12 +18,13 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/claude-code-opencode/claude-proxy/internal/codex"
 	"github.com/claude-code-opencode/claude-proxy/internal/config"
 	"github.com/claude-code-opencode/claude-proxy/internal/log"
 	"github.com/claude-code-opencode/claude-proxy/internal/models"
+	"github.com/claude-code-opencode/claude-proxy/internal/providers/codex"
+	"github.com/claude-code-opencode/claude-proxy/internal/providers/errs"
+	"github.com/claude-code-opencode/claude-proxy/internal/providers/zen"
 	"github.com/claude-code-opencode/claude-proxy/internal/proxy"
-	"github.com/claude-code-opencode/claude-proxy/internal/upstream"
 	"github.com/claude-code-opencode/claude-proxy/internal/web"
 )
 
@@ -71,7 +73,10 @@ func persistConfig(cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0600)
 }
 
 func generateWebInterfaceKey() (string, error) {
@@ -85,7 +90,11 @@ func generateWebInterfaceKey() (string, error) {
 func cmdHealthcheck(args []string) {
 	// Load config to respect the configured listen address. When no config
 	// file exists the default 127.0.0.1:3000 is used.
-	cfg, _ := config.Load(args)
+	cfg, err := config.Load(args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "healthcheck config load:", err)
+		os.Exit(1)
+	}
 	addr := cfg.ListenAddr
 	if addr == "" {
 		addr = "127.0.0.1:3000"
@@ -140,7 +149,7 @@ type modelStatus struct {
 	ok   bool
 }
 
-func printBanner(cfg *config.Config, v string, modelStatuses []modelStatus) {
+func printBanner(cfg *config.Config, h *proxy.Handler, v string, modelStatuses []modelStatus) {
 	const w = 55
 
 	center := func(s string) string {
@@ -186,6 +195,10 @@ func printBanner(cfg *config.Config, v string, modelStatuses []modelStatus) {
 		shownModels := make([]config.ModelSpec, 0, len(cfg.Models))
 		for _, m := range cfg.EffectiveModels() {
 			if m.Upstream == config.CodexUpstreamName && !codexAvailable {
+				continue
+			}
+			if h.IsModelUpstreamUnavailable(m.Upstream, m.Name) {
+				// The upstream no longer serves this model — hide it.
 				continue
 			}
 			shownModels = append(shownModels, m)
@@ -281,16 +294,24 @@ func cmdServe(args []string) {
 	srv := proxy.NewServer(cfg, logger)
 
 	proxy.SetVersion(version)
-
-	// Check model availability and render the banner before normal runtime logs,
-	// keeping startup output easy to scan. Server.Start refreshes the catalog in
-	// the background after it has bound the listener.
-	modelStatuses := checkModelsAtStartup(cfg.ResolvedConfig(), srv)
-	printBanner(cfg, version, modelStatuses)
-
 	srv.Setup()
 	srv.StartTokenRefresh()
 	srv.StartConfigWatcher()
+
+	// Run model availability probes BEFORE starting the HTTP server, so
+	// global rate limits are detected and upstreams pre-disabled before
+	// any real request can trigger a cascade.
+	modelStatuses := checkModelsAtStartup(cfg.ResolvedConfig(), srv)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Start()
+	}()
+
+	// The running banner lists the available models; log "server starting" only
+	// afterwards so it does not appear above the model table in the console.
+	printBanner(srv.Handler().GetConfig(), srv.Handler(), version, modelStatuses)
+	logger.Info("server starting", "addr", cfg.ListenAddr)
 
 	// Start web interface if configured
 	if cfg.WebInterfacePort != "" {
@@ -332,8 +353,8 @@ func cmdServe(args []string) {
 			}
 			// Preserve write-only API keys when the UI submits an existing upstream
 			// without a replacement key.
-			if next.UpstreamAPIKey == "" {
-				next.UpstreamAPIKey = cfg.UpstreamAPIKey
+			if next.ZenAPIKey == "" {
+				next.ZenAPIKey = cfg.ZenAPIKey
 			}
 			for i := range next.Upstreams {
 				if next.Upstreams[i].APIKey != "" {
@@ -362,6 +383,7 @@ func cmdServe(args []string) {
 			srv.RebuildRouter(next)
 			// Keep the local cfg pointer in sync for the save and Codex flows.
 			cfg = next
+			webProvider.SetConfig(next)
 			return persistConfig(cfg)
 		}, func() (string, error) {
 			pkce, err := codex.GeneratePKCE()
@@ -388,12 +410,28 @@ func cmdServe(args []string) {
 					webProvider.SetLoginError(exErr.Error())
 					return
 				}
-				cfg.CodexOAuthToken = tokens.AccessToken
-				cfg.CodexAccountID = tokens.AccountID
-				if saveErr := persistConfig(cfg); saveErr != nil {
+				// Atomically update the running config to avoid race with web callback.
+				// Get current config, apply token updates, persist and publish.
+				current := srv.Handler().GetConfig()
+				next := *current
+				next.CodexOAuthToken = tokens.AccessToken
+				next.CodexAccountID = tokens.AccountID
+				next.Precompute()
+				if issues := next.Validate(); len(issues) > 0 {
+					webProvider.SetLoginError("invalid config after token update: " + strings.Join(issues, "; "))
+					return
+				}
+				// Publish atomically so concurrent handlers see consistent snapshot.
+				srv.Handler().UpdateConfig(&next)
+				srv.RebuildRouter(&next)
+				// Persist to disk.
+				if saveErr := persistConfig(&next); saveErr != nil {
 					webProvider.SetLoginError(saveErr.Error())
 					return
 				}
+				// Keep local cfg in sync for any subsequent operations in main().
+				cfg = &next
+				webProvider.SetConfig(&next)
 				webProvider.SetLoginComplete()
 			}()
 
@@ -401,6 +439,16 @@ func cmdServe(args []string) {
 		})
 		webProvider.SetPersistConfig(func(c *config.Config) error {
 			return persistConfig(c)
+		})
+		// Model reorder must take effect on the runtime handler immediately, not
+		// only after a restart. Apply it to the handler's atomic config, keep the
+		// local cfg/provider pointers in sync, then persist the new order.
+		webProvider.SetReorderModels(func(names []string) error {
+			srv.Handler().ReorderModels(names)
+			updated := srv.Handler().GetConfig()
+			cfg = updated
+			webProvider.SetConfig(updated)
+			return persistConfig(updated)
 		})
 		webSrv := web.NewServer(webAddr, cfg.WebInterfaceKey, webProvider)
 		go func() {
@@ -413,11 +461,6 @@ func cmdServe(args []string) {
 	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- srv.Start()
-	}()
 
 	select {
 	case <-sigCh:
@@ -441,7 +484,9 @@ func checkModelsAtStartup(cfg *config.Config, srv *proxy.Server) []modelStatus {
 
 	var statuses []modelStatus
 	seen := make(map[string]bool)
-	add := func(name string, check func(context.Context) error) bool {
+
+	h := srv.Handler()
+	add := func(name, upstream string, check func(context.Context) error) bool {
 		if seen[name] {
 			return true
 		}
@@ -449,69 +494,99 @@ func checkModelsAtStartup(cfg *config.Config, srv *proxy.Server) []modelStatus {
 		ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 		err := check(ctx)
 		cancel()
+		if errors.Is(err, errs.ErrModelUnavailable) {
+			// The upstream no longer serves this model: mark it so routing
+			// skips it and listings hide it, and keep it out of the banner.
+			h.MarkModelUpstreamUnavailable(upstream, name)
+			return false
+		}
+		if errors.Is(err, errs.ErrRateLimited) {
+			// Model is rate limited at startup: pre-blacklist for circuit breaker
+			// cooldown so it's not tried on real requests.
+			h.DisableModelUpstream(upstream, name, "rate_limit")
+			statuses = append(statuses, modelStatus{name: name, ok: false})
+			return false
+		}
 		statuses = append(statuses, modelStatus{name: name, ok: err == nil})
-		srv.Handler().RecordModelProbe(name, err)
+		h.RecordModelProbe(name, err)
 		return err == nil
 	}
+	addDiscovered := func(name string) {
+		if seen[name] {
+			return
+		}
+		seen[name] = true
+		statuses = append(statuses, modelStatus{name: name, ok: true})
+	}
 
-	// Check configured routes first, then the complete discovered free catalog
-	// and known Codex catalog so the banner is a useful availability overview.
-	for _, spec := range cfg.EffectiveModels() {
+	// Probe all configured models at startup to know which are available.
+	// This avoids free-tier quota surprises on first real request.
+	configuredModels := cfg.EffectiveModels()
+	// Build a single Codex client up front and reuse it for every codex model
+	// probe, rather than allocating one per model in the loop below.
+	var codexClient *codex.Client
+	if cfg.CodexOAuthToken != "" {
+		codexClient = codex.NewClient(codex.CodexBackendURL, cfg.CodexOAuthToken, cfg.CodexAccountID, probeTimeout)
+	}
+	for _, spec := range configuredModels {
 		if spec.Upstream == config.CodexUpstreamName {
-			if cfg.CodexOAuthToken == "" {
-				add(spec.Name, func(context.Context) error { return fmt.Errorf("codex is not authenticated") })
-				continue
+			if codexClient == nil {
+				add(spec.Name, spec.Upstream, func(context.Context) error { return fmt.Errorf("codex is not authenticated") })
+			} else {
+				c := codexClient
+				add(spec.Name, spec.Upstream, func(ctx context.Context) error { return c.CheckModel(ctx, spec.Name) })
 			}
-			client := upstream.NewCodexClient(codex.CodexBackendURL, cfg.CodexOAuthToken, cfg.CodexAccountID, probeTimeout)
-			add(spec.Name, func(ctx context.Context) error { return client.CheckModel(ctx, spec.Name) })
-			continue
+		} else {
+			client, err := upstreamClientForSpec(cfg, spec)
+			if err == nil && (spec.Upstream != config.DefaultUpstreamName || !cfg.PassthroughAPIKey || cfg.ZenAPIKey != "") {
+				add(spec.Name, spec.Upstream, func(ctx context.Context) error { return checkOpenCodeCompatibleModel(ctx, client, spec) })
+			}
 		}
-		client, err := upstreamClientForSpec(cfg, spec)
-		if err != nil {
-			add(spec.Name, func(context.Context) error { return err })
-			continue
-		}
-		add(spec.Name, func(ctx context.Context) error { return client.CheckChatCompletion(ctx, spec.Name) })
 	}
 
-	// OpenCode catalog models that are not explicitly in models[] are still
-	// useful to display (notably newly available -free models).
-	catalog := srv.Catalog().GetModels(true)
-	freeClient := upstream.NewClient(cfg.UpstreamBaseURL, cfg.UpstreamAPIKey, probeTimeout)
-	for _, model := range models.FilteredModels(catalog) {
-		model := model
-		add(model.ID, func(ctx context.Context) error { return freeClient.CheckChatCompletion(ctx, model.ID) })
+	// Discover the account's current Zen catalog without probing.
+	if cfg.ZenAPIKey != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+		err := srv.RefreshOpenCodeModels(ctx)
+		cancel()
+		if err == nil {
+			for _, model := range srv.Catalog().CachedModels() {
+				if config.IsOpenCodeModelSupported(model.ID) {
+					addDiscovered(model.ID)
+				}
+			}
+		}
 	}
 
-	// Always show the complete known Codex catalog. Unauthenticated Codex models
-	// intentionally appear red rather than disappearing from the overview.
-	codexClient := upstream.NewCodexClient(codex.CodexBackendURL, cfg.CodexOAuthToken, cfg.CodexAccountID, probeTimeout)
-	for _, model := range []string{
-		codex.ModelGPT56,
-		codex.ModelGPT56Sol,
-		codex.ModelGPT56Terra,
-		codex.ModelGPT56Luna,
-		codex.ModelGPT54,
-		codex.ModelGPT54Mini,
-	} {
-		model := model
-		if cfg.CodexOAuthToken == "" {
-			add(model, func(context.Context) error { return fmt.Errorf("codex is not authenticated") })
-			continue
+	// Codex's model endpoint is already scoped to the authenticated account.
+	if cfg.CodexOAuthToken != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := srv.RefreshCodexModels(ctx)
+		cancel()
+		if err == nil {
+			for _, model := range srv.Handler().DiscoveredCodexModels() {
+				addDiscovered(model.Slug)
+			}
 		}
-		add(model, func(ctx context.Context) error { return codexClient.CheckModel(ctx, model) })
 	}
 
 	return statuses
 }
 
-func upstreamClientForSpec(cfg *config.Config, spec config.ModelSpec) (*upstream.Client, error) {
+func checkOpenCodeCompatibleModel(ctx context.Context, client *zen.Client, spec config.ModelSpec, authOverride ...string) error {
+	if config.UsesOpenCodeResponsesAPI(spec.Name, spec.Upstream) {
+		return client.CheckResponses(ctx, spec.Name, authOverride...)
+	}
+	return client.CheckChatCompletion(ctx, spec.Name, authOverride...)
+}
+
+func upstreamClientForSpec(cfg *config.Config, spec config.ModelSpec) (*zen.Client, error) {
 	if spec.Upstream == config.DefaultUpstreamName {
-		return upstream.NewClient(cfg.UpstreamBaseURL, cfg.UpstreamAPIKey, 10*time.Second), nil
+		return zen.NewClient(spec.Upstream, cfg.ZenBaseURL, cfg.ZenAPIKey, 10*time.Second), nil
 	}
 	for _, candidate := range cfg.Upstreams {
 		if candidate.Name == spec.Upstream {
-			return upstream.NewClient(candidate.BaseURL, candidate.APIKey, 10*time.Second), nil
+			return zen.NewClient(spec.Upstream, candidate.BaseURL, candidate.APIKey, 10*time.Second), nil
 		}
 	}
 	return nil, fmt.Errorf("unknown upstream %q", spec.Upstream)
@@ -529,55 +604,53 @@ func cmdModels(args []string) {
 		codex.SetConfigFilePath(cfg.ConfigFile)
 	}
 
-	catalog := models.NewCatalog(cfg.UpstreamBaseURL, cfg.UpstreamAPIKey, cfg.ModelCacheTTL)
-	upstreamModels := catalog.GetModels(true)
+	catalog := models.NewCatalog(cfg.ZenBaseURL, cfg.ZenAPIKey, cfg.ModelCacheTTL)
+	var upstreamModels []models.ModelEntry
+	if cfg.PassthroughAPIKey && cfg.ZenAPIKey == "" {
+		fmt.Println("OpenCode catalog skipped: passthrough mode requires a caller credential")
+	} else if err := catalog.Fetch(); err != nil {
+		fmt.Fprintf(os.Stderr, "OpenCode catalog error: %v\n", err)
+	} else {
+		upstreamModels = catalog.GetModels(false)
+	}
 
-	// Codex models (ChatGPT subscription)
+	// Codex models available to this ChatGPT account.
 	if tokens, err := codex.LoadTokens(); err == nil {
-		codexClient := upstream.NewCodexClient(codex.CodexBackendURL, tokens.AccessToken, tokens.AccountID, cfg.RequestTimeout)
-		ctx := context.Background()
-
-		// Check each model
+		codexClient := codex.NewClient(codex.CodexBackendURL, tokens.AccessToken, tokens.AccountID, cfg.RequestTimeout)
 		fmt.Println("Codex models (ChatGPT subscription):")
-		for _, id := range []string{
-			codex.ModelGPT56Sol,
-			codex.ModelGPT56Terra,
-			codex.ModelGPT56Luna,
-			codex.ModelGPT54,
-			codex.ModelGPT54Mini,
-		} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		discovered, fetchErr := codexClient.Models(ctx)
+		cancel()
+		if fetchErr != nil {
+			fmt.Printf("  unavailable: %v\n", fetchErr)
+		}
+		for _, model := range discovered {
+			id := model.Slug
 			suffix := ""
 			if id == cfg.DefaultModel {
 				suffix = " (default)"
 			}
-			if err := codexClient.CheckModel(ctx, id); err != nil {
-				fmt.Printf("  %s ❌ %v%s\n", id, err, suffix)
-			} else {
-				fmt.Printf("  %s ✅%s\n", id, suffix)
-			}
+			fmt.Printf("  %s ✅%s\n", id, suffix)
 		}
 		fmt.Println()
 	}
 
-	// Free models (bundled) — test each one
-	freeModels := models.FilteredModels(upstreamModels)
-	fmt.Println("Free models (included by default):")
-	client := upstream.NewClient(cfg.UpstreamBaseURL, cfg.UpstreamAPIKey, cfg.RequestTimeout)
-	ctx := context.Background()
-	for _, m := range freeModels {
+	compatible := make([]models.ModelEntry, 0, len(upstreamModels))
+	for _, model := range upstreamModels {
+		if config.IsOpenCodeModelSupported(model.ID) {
+			compatible = append(compatible, model)
+		}
+	}
+	fmt.Println("OpenCode Zen models supported by this proxy:")
+	for _, m := range compatible {
 		suffix := ""
 		if m.ID == cfg.DefaultModel {
 			suffix = " (default)"
 		}
-		if err := client.CheckChatCompletion(ctx, m.ID); err != nil {
-			fmt.Printf("  %s ❌ %v%s\n", m.ID, err, suffix)
-		} else {
-			fmt.Printf("  %s ✅%s\n", m.ID, suffix)
-		}
+		fmt.Printf("  %s ✅%s\n", m.ID, suffix)
 	}
 
-	fmt.Printf("\nTotal: %d free, %d upstream\n",
-		len(freeModels), len(upstreamModels))
+	fmt.Printf("\nTotal: %d supported Zen, %d returned by Zen\n", len(compatible), len(upstreamModels))
 }
 
 func cmdCheck(args []string) {
@@ -589,7 +662,7 @@ func cmdCheck(args []string) {
 
 	fmt.Println("=== Configuration ===")
 	fmt.Printf("Listen:      %s\n", cfg.ListenAddr)
-	fmt.Printf("Upstream:    %s\n", cfg.UpstreamBaseURL)
+	fmt.Printf("Upstream:    %s\n", cfg.ZenBaseURL)
 	fmt.Printf("API Key:     %s\n", cfg.MaskedKey())
 	fmt.Printf("Default:     %s\n", cfg.DefaultModel)
 	fmt.Printf("Passthrough: %v\n", cfg.PassthroughAPIKey)
@@ -632,59 +705,65 @@ func cmdCheck(args []string) {
 	fmt.Println("✅ Config validation passed")
 
 	ctx := context.Background()
-	client := upstream.NewClient(cfg.UpstreamBaseURL, cfg.UpstreamAPIKey, cfg.RequestTimeout)
-
-	fmt.Println("\n=== Upstream Connectivity ===")
-	if err := client.Check(ctx); err != nil {
-		fmt.Printf("❌ Models endpoint: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println("✅ Models endpoint: OK")
-
-	if err := client.CheckChatCompletion(ctx, cfg.DefaultModel); err != nil {
-		fmt.Printf("❌ Chat completions endpoint: %v\n", err)
-	} else {
-		fmt.Println("✅ Chat completions endpoint: OK")
-	}
-
-	fmt.Println("\n=== Model Validation ===")
-	catalog := models.NewCatalog(cfg.UpstreamBaseURL, cfg.UpstreamAPIKey, cfg.ModelCacheTTL)
-	upstreamModels := catalog.GetModels(true)
-
-	defaultFound := false
-	for _, m := range upstreamModels {
-		if m.ID == cfg.DefaultModel {
-			defaultFound = true
-			break
+	if len(cfg.EffectiveModels()) == 0 {
+		catalog := models.NewCatalog(cfg.ZenBaseURL, cfg.ZenAPIKey, cfg.ModelCacheTTL)
+		if err := catalog.FetchWithContext(ctx); err != nil {
+			fmt.Printf("❌ OpenCode model discovery: %v\n", err)
+			os.Exit(1)
+		}
+		for _, model := range models.FilteredModels(catalog.CachedModels()) {
+			if config.IsOpenCodeModelSupported(model.ID) && !config.IsOpenCodeContributorFree(model.ID) {
+				cfg.Models = append(cfg.Models, config.ModelSpec{Name: model.ID, Upstream: config.DefaultUpstreamName})
+			}
+		}
+		cfg.Precompute()
+		if len(cfg.EffectiveModels()) == 0 {
+			fmt.Println("❌ OpenCode model discovery returned no compatible free model")
+			os.Exit(1)
 		}
 	}
-	if defaultFound {
-		fmt.Printf("✅ Default model '%s' found upstream\n", cfg.DefaultModel)
-	} else {
-		fmt.Printf("❌ Default model '%s' NOT found upstream\n", cfg.DefaultModel)
+	primary := cfg.EffectiveModels()[0]
+	fmt.Println("\n=== Primary Route ===")
+	var primaryErr error
+	switch primary.Upstream {
+	case config.CodexUpstreamName:
+		if cfg.CodexOAuthToken == "" {
+			primaryErr = fmt.Errorf("codex is not authenticated")
+		} else {
+			client := codex.NewClient(codex.CodexBackendURL, cfg.CodexOAuthToken, cfg.CodexAccountID, cfg.RequestTimeout)
+			primaryErr = client.CheckModel(ctx, primary.Name)
+		}
+	default:
+		client, err := upstreamClientForSpec(cfg, primary)
+		if err != nil {
+			primaryErr = err
+		} else if cfg.PassthroughAPIKey && primary.Upstream == config.DefaultUpstreamName && cfg.ZenAPIKey == "" {
+			fmt.Println("⚠️  Primary route probe skipped: passthrough requires a caller credential")
+		} else if primary.Upstream == config.DefaultUpstreamName {
+			primaryErr = checkOpenCodeCompatibleModel(ctx, client, primary)
+		} else {
+			primaryErr = client.CheckChatCompletion(ctx, primary.Name)
+		}
+	}
+	if primaryErr != nil {
+		fmt.Printf("❌ %s@%s: %v\n", primary.Name, primary.Upstream, primaryErr)
 		os.Exit(1)
 	}
+	if !cfg.PassthroughAPIKey || primary.Upstream != config.DefaultUpstreamName || cfg.ZenAPIKey != "" {
+		fmt.Printf("✅ %s@%s is usable\n", primary.Name, primary.Upstream)
+	}
 
-	// Codex models
+	// Account-scoped Codex catalog.
 	if cfg.CodexOAuthToken != "" {
-		codexClient := upstream.NewCodexClient(codex.CodexBackendURL, cfg.CodexOAuthToken, cfg.CodexAccountID, cfg.RequestTimeout)
+		codexClient := codex.NewClient(codex.CodexBackendURL, cfg.CodexOAuthToken, cfg.CodexAccountID, cfg.RequestTimeout)
 		fmt.Println("\n=== Codex Models ===")
-		for _, id := range []string{
-			codex.ModelGPT56Sol,
-			codex.ModelGPT56Terra,
-			codex.ModelGPT56Luna,
-			codex.ModelGPT54,
-			codex.ModelGPT54Mini,
-		} {
-			suffix := ""
-			if id == cfg.DefaultModel {
-				suffix = " (default)"
-			}
-			if err := codexClient.CheckModel(ctx, id); err != nil {
-				fmt.Printf("  %s ❌ %v%s\n", id, err, suffix)
-			} else {
-				fmt.Printf("  %s ✅%s\n", id, suffix)
-			}
+		discovered, err := codexClient.Models(ctx)
+		if err != nil {
+			fmt.Printf("❌ Catalog: %v\n", err)
+			os.Exit(1)
+		}
+		for _, model := range discovered {
+			fmt.Printf("  %s ✅\n", model.Slug)
 		}
 	}
 
@@ -825,11 +904,14 @@ func cmdConfig(args []string) {
 	fmt.Println("Press Enter to keep current value, or type a new one.")
 	fmt.Println()
 
-	// Server (OpenCode is the hardcoded default upstream — no need to repoint it)
+	// Server and built-in OpenCode Zen upstream.
 	fmt.Printf("── Server ────────────────────────────────────────\n")
 	listenPort := promptString("Listen port", extractPort(cfg.ListenAddr))
 	if listenPort != "" {
 		cfg.ListenAddr = "0.0.0.0:" + listenPort
+	}
+	if key := promptSecret("OpenCode Zen API key", cfg.ZenAPIKey != ""); key != "" {
+		cfg.ZenAPIKey = key
 	}
 	fmt.Println()
 
@@ -965,6 +1047,17 @@ func promptString(label, current string) string {
 	return input
 }
 
+func promptSecret(label string, configured bool) string {
+	if configured {
+		fmt.Printf("  %s [(configured), Enter keeps it]: ", label)
+	} else {
+		fmt.Printf("  %s: ", label)
+	}
+	var input string
+	_, _ = fmt.Scanln(&input)
+	return strings.TrimSpace(input)
+}
+
 func extractPort(addr string) string {
 	if parts := strings.Split(addr, ":"); len(parts) > 0 {
 		return parts[len(parts)-1]
@@ -1002,12 +1095,12 @@ func configToFileConfig(cfg *config.Config) *config.FileConfig {
 		LogFormat:        cfg.LogFormat,
 		WebInterfacePort: cfg.WebInterfacePort,
 	}
-	// Only write upstream_base_url if the user overrode the hardcoded default
-	if cfg.UpstreamBaseURL != config.OpenCodeBaseURL {
-		fc.UpstreamBaseURL = cfg.UpstreamBaseURL
+	// Only write zen_base_url if the user overrode the hardcoded default
+	if cfg.ZenBaseURL != config.OpenCodeBaseURL {
+		fc.ZenBaseURL = cfg.ZenBaseURL
 	}
-	if cfg.UpstreamAPIKey != "" && cfg.UpstreamAPIKey != "public" {
-		fc.UpstreamAPIKey = cfg.UpstreamAPIKey
+	if cfg.ZenAPIKey != "" {
+		fc.ZenAPIKey = cfg.ZenAPIKey
 	}
 	if cfg.InboundAPIKey != "" {
 		fc.InboundAPIKey = cfg.InboundAPIKey
@@ -1030,6 +1123,7 @@ func configToFileConfig(cfg *config.Config) *config.FileConfig {
 	fc.PassthroughKey = &cfg.PassthroughAPIKey
 	fc.AllowUnlisted = &cfg.AllowUnlisted
 	fc.ExposeAllModels = &cfg.ExposeAllModels
+	fc.OnlyPreferredModels = &cfg.OnlyPreferredModels
 	if cfg.RequestTimeout > 0 {
 		fc.RequestTimeout = cfg.RequestTimeout.String()
 	}
@@ -1043,11 +1137,11 @@ func applyFileConfig(cfg *config.Config, fc *config.FileConfig) {
 	if fc.ListenAddr != "" {
 		cfg.ListenAddr = fc.ListenAddr
 	}
-	if fc.UpstreamBaseURL != "" {
-		cfg.UpstreamBaseURL = fc.UpstreamBaseURL
+	if fc.ZenBaseURL != "" {
+		cfg.ZenBaseURL = fc.ZenBaseURL
 	}
-	if fc.UpstreamAPIKey != "" {
-		cfg.UpstreamAPIKey = fc.UpstreamAPIKey
+	if fc.ZenAPIKey != "" {
+		cfg.ZenAPIKey = fc.ZenAPIKey
 	}
 	if fc.InboundAPIKey != "" {
 		cfg.InboundAPIKey = fc.InboundAPIKey
@@ -1110,16 +1204,22 @@ func applyFileConfig(cfg *config.Config, fc *config.FileConfig) {
 }
 
 func exportFullConfig(cfg *config.Config, outPath string) {
+	maxBodySize := cfg.MaxBodySize
 	exp := ExportConfig{
-		ListenPort:        extractPort(cfg.ListenAddr),
-		UpstreamBaseURL:   cfg.UpstreamBaseURL,
-		UpstreamAPIKey:    cfg.UpstreamAPIKey,
-		PassthroughAPIKey: cfg.PassthroughAPIKey,
-		ReasoningModel:    cfg.ReasoningModel,
-		CompletionModel:   cfg.CompletionModel,
-		AllowUnlisted:     cfg.AllowUnlisted,
-		ExposeAllModels:   cfg.ExposeAllModels,
-		RequestTimeout:    cfg.RequestTimeout.String(),
+		ListenPort:          extractPort(cfg.ListenAddr),
+		ZenBaseURL:          cfg.ZenBaseURL,
+		ZenAPIKey:           cfg.ZenAPIKey,
+		InboundAPIKey:       cfg.InboundAPIKey,
+		PassthroughAPIKey:   cfg.PassthroughAPIKey,
+		ReasoningModel:      cfg.ReasoningModel,
+		CompletionModel:     cfg.CompletionModel,
+		AllowUnlisted:       cfg.AllowUnlisted,
+		ExposeAllModels:     cfg.ExposeAllModels,
+		OnlyPreferredModels: cfg.OnlyPreferredModels,
+		MaxBodySize:         &maxBodySize,
+		RequestTimeout:      cfg.RequestTimeout.String(),
+		WebInterfacePort:    cfg.WebInterfacePort,
+		WebInterfaceKey:     cfg.WebInterfaceKey,
 	}
 
 	// `models` is the single ordered list (1st = default, rest = fallbacks).
@@ -1160,19 +1260,24 @@ type ExportConfig struct {
 	ListenPort string `json:"listen_port"`
 
 	// Upstream
-	UpstreamBaseURL string `json:"upstream_base_url,omitempty"`
-	UpstreamAPIKey  string `json:"upstream_api_key,omitempty"`
+	ZenBaseURL string `json:"zen_base_url,omitempty"`
+	ZenAPIKey  string `json:"zen_api_key,omitempty"`
 
 	// Auth
-	PassthroughAPIKey bool `json:"passthrough_api_key,omitempty"`
+	InboundAPIKey     string `json:"inbound_api_key,omitempty"`
+	PassthroughAPIKey bool   `json:"passthrough_api_key,omitempty"`
 
 	// Models
-	ReasoningModel  string                  `json:"reasoning_model,omitempty"`
-	CompletionModel string                  `json:"completion_model,omitempty"`
-	Models          []config.ModelSpec      `json:"models,omitempty"`
-	Upstreams       []config.UpstreamConfig `json:"upstreams,omitempty"`
-	AllowUnlisted   bool                    `json:"allow_unlisted_models,omitempty"`
-	ExposeAllModels bool                    `json:"expose_all_models,omitempty"`
+	ReasoningModel      string                  `json:"reasoning_model,omitempty"`
+	CompletionModel     string                  `json:"completion_model,omitempty"`
+	Models              []config.ModelSpec      `json:"models,omitempty"`
+	Upstreams           []config.UpstreamConfig `json:"upstreams,omitempty"`
+	AllowUnlisted       bool                    `json:"allow_unlisted_models,omitempty"`
+	ExposeAllModels     bool                    `json:"expose_all_models,omitempty"`
+	OnlyPreferredModels bool                    `json:"only_preferred_models,omitempty"`
+
+	// Body
+	MaxBodySize *int64 `json:"max_body_size,omitempty"`
 
 	// Timeouts
 	RequestTimeout string `json:"request_timeout,omitempty"`
@@ -1181,6 +1286,10 @@ type ExportConfig struct {
 	// Logging
 	LogLevel  string `json:"log_level,omitempty"`
 	LogFormat string `json:"log_format,omitempty"`
+
+	// Web interface
+	WebInterfacePort string `json:"web_interface_port,omitempty"`
+	WebInterfaceKey  string `json:"web_interface_key,omitempty"`
 
 	// Codex
 	CodexOAuthToken   string `json:"codex_oauth_token,omitempty"`

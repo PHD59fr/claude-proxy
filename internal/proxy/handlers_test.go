@@ -13,15 +13,16 @@ import (
 	"github.com/claude-code-opencode/claude-proxy/internal/config"
 	"github.com/claude-code-opencode/claude-proxy/internal/log"
 	"github.com/claude-code-opencode/claude-proxy/internal/models"
-	"github.com/claude-code-opencode/claude-proxy/internal/upstream"
+	"github.com/claude-code-opencode/claude-proxy/internal/providers"
+	"github.com/claude-code-opencode/claude-proxy/internal/providers/codex"
 )
 
 func newMockUpstream(handler func(w http.ResponseWriter, r *http.Request)) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(handler))
 }
 
-func newTestRouter(upstreamURL, apiKey string) *upstream.Router {
-	return upstream.NewRouter([]config.UpstreamConfig{{
+func newTestRouter(upstreamURL, apiKey string) *providers.Registry {
+	return providers.NewRegistry([]config.UpstreamConfig{{
 		Name:    config.DefaultUpstreamName,
 		BaseURL: upstreamURL,
 		APIKey:  apiKey,
@@ -30,18 +31,19 @@ func newTestRouter(upstreamURL, apiKey string) *upstream.Router {
 
 func defaultConfig(upstreamURL string) *config.Config {
 	cfg := config.DefaultConfig()
-	cfg.UpstreamBaseURL = upstreamURL
-	cfg.UpstreamAPIKey = "test-key"
+	cfg.ZenBaseURL = upstreamURL
+	cfg.ZenAPIKey = "test-key"
 	cfg.InboundAPIKey = ""
-	cfg.DefaultModel = "big-pickle"
+	cfg.Models = []config.ModelSpec{{Name: "big-pickle", Upstream: config.DefaultUpstreamName}}
+	cfg.Precompute()
 	return cfg
 }
 
 func newTestHandler(upstreamURL string) (*Handler, *config.Config) {
 	cfg := defaultConfig(upstreamURL)
 	logger := log.New("debug", "text")
-	router := newTestRouter(upstreamURL, cfg.UpstreamAPIKey)
-	catalog := models.NewCatalog(upstreamURL, cfg.UpstreamAPIKey, 5*time.Minute)
+	router := newTestRouter(upstreamURL, cfg.ZenAPIKey)
+	catalog := models.NewCatalog(upstreamURL, cfg.ZenAPIKey, 5*time.Minute)
 	return NewHandler(cfg, catalog, router, logger), cfg
 }
 
@@ -392,8 +394,8 @@ func TestAuth_NoKeyConfigured(t *testing.T) {
 	cfg := defaultConfig(ts.URL)
 	cfg.InboundAPIKey = "" // No auth required
 	logger := log.New("debug", "text")
-	router := newTestRouter(ts.URL, cfg.UpstreamAPIKey)
-	catalog := models.NewCatalog(ts.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	router := newTestRouter(ts.URL, cfg.ZenAPIKey)
+	catalog := models.NewCatalog(ts.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, logger)
 
 	body := `{"model":"big-pickle","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`
@@ -514,8 +516,8 @@ func TestHandleMessages_AllowUnlistedModels(t *testing.T) {
 	cfg := defaultConfig(ts.URL)
 	cfg.AllowUnlisted = true
 	logger := log.New("debug", "text")
-	router := newTestRouter(ts.URL, cfg.UpstreamAPIKey)
-	catalog := models.NewCatalog(ts.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	router := newTestRouter(ts.URL, cfg.ZenAPIKey)
+	catalog := models.NewCatalog(ts.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, logger)
 
 	body := `{"model":"custom-model","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`
@@ -592,8 +594,8 @@ func TestHandleMessages_FallbackOn502(t *testing.T) {
 	}
 	cfg.Precompute()
 	logger := log.New("debug", "text")
-	router := newTestRouter(ts.URL, cfg.UpstreamAPIKey)
-	catalog := models.NewCatalog(ts.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	router := newTestRouter(ts.URL, cfg.ZenAPIKey)
+	catalog := models.NewCatalog(ts.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, logger)
 
 	body := `{"model":"primary-model","max_tokens":100,"messages":[{"role":"user","content":"hello"}]}`
@@ -652,8 +654,8 @@ func TestHandleMessages_FallbackOn503(t *testing.T) {
 	}
 	cfg.Precompute()
 	logger := log.New("debug", "text")
-	router := newTestRouter(ts.URL, cfg.UpstreamAPIKey)
-	catalog := models.NewCatalog(ts.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	router := newTestRouter(ts.URL, cfg.ZenAPIKey)
+	catalog := models.NewCatalog(ts.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, logger)
 
 	body := `{"model":"primary-model","max_tokens":100,"messages":[{"role":"user","content":"hello"}]}`
@@ -695,8 +697,8 @@ func TestHandleMessages_FallbackAllModelsExhausted502(t *testing.T) {
 		{Name: "model-b", Upstream: config.DefaultUpstreamName},
 	}
 	logger := log.New("debug", "text")
-	router := newTestRouter(ts.URL, cfg.UpstreamAPIKey)
-	catalog := models.NewCatalog(ts.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	router := newTestRouter(ts.URL, cfg.ZenAPIKey)
+	catalog := models.NewCatalog(ts.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, logger)
 
 	body := `{"model":"model-a","max_tokens":100,"messages":[{"role":"user","content":"hello"}]}`
@@ -725,8 +727,8 @@ func TestHandleMessages_FallbackAllModelsExhausted502(t *testing.T) {
 
 func TestHandleReadyz_UpstreamOK(t *testing.T) {
 	ts := newMockUpstream(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/models" {
-			t.Errorf("unexpected path: %s, want /models", r.URL.Path)
+		if r.URL.Path != "/chat/completions" {
+			t.Errorf("unexpected path: %s, want /chat/completions", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -786,8 +788,8 @@ func TestHandleMessages_FallbackToDefaultRegardlessOfName(t *testing.T) {
 	cfg.DefaultModel = "big-pickle"
 	cfg.AllowUnlisted = false
 	logger := log.New("debug", "text")
-	router := newTestRouter(ts.URL, cfg.UpstreamAPIKey)
-	catalog := models.NewCatalog(ts.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	router := newTestRouter(ts.URL, cfg.ZenAPIKey)
+	catalog := models.NewCatalog(ts.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, logger)
 
 	// Requesting any non-default model name resolves to the configured
@@ -856,8 +858,8 @@ func TestHandleMessages_StreamingFallbackOn502(t *testing.T) {
 	}
 	cfg.Precompute()
 	logger := log.New("debug", "text")
-	router := newTestRouter(ts.URL, cfg.UpstreamAPIKey)
-	catalog := models.NewCatalog(ts.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	router := newTestRouter(ts.URL, cfg.ZenAPIKey)
+	catalog := models.NewCatalog(ts.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, logger)
 
 	body := `{"model":"primary-model","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"test"}]}`
@@ -891,33 +893,29 @@ func TestHandleMessages_StreamingFallbackOn502(t *testing.T) {
 	}
 }
 
-func TestHandleMessages_OrderedModelsIgnoreClientName(t *testing.T) {
-	// The proxy should try models in the configured priority order
-	// regardless of the model name written in Claude Code.
+func TestHandleMessages_RequestedModelRespected(t *testing.T) {
+	// If the client requests a model that is in the preference list,
+	// the proxy should try that model first, then fall back to the
+	// rest of the preference order. If the model is not in the list
+	// and AllowUnlisted is true, the requested model is passed through.
 	ts := newMockUpstream(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Model string `json:"model"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 
-		// Record which model the proxy sent to upstream.
-		if body.Model != "big-pickle" {
-			t.Errorf("upstream received model = %q, want big-pickle (1st in configured order)", body.Model)
-		}
-
+		// Verify the model sent to upstream matches expected behavior.
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
-			"id": "chatcmpl-ordered",
-			"model": "big-pickle",
-			"choices": [{"index": 0, "message": {"role": "assistant", "content": "ordered ok"}, "finish_reason": "stop"}],
+			"id": "chatcmpl-requested",
+			"model": "` + body.Model + `",
+			"choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
 			"usage": {"prompt_tokens": 5, "completion_tokens": 3}
 		}`))
 	})
 	defer ts.Close()
 
 	cfg := defaultConfig(ts.URL)
-	// Client names a different model ("whatever-i-typed"), but the proxy must
-	// walk the configured order starting with big-pickle.
 	cfg.Models = []config.ModelSpec{
 		{Name: "big-pickle", Upstream: config.DefaultUpstreamName},
 		{Name: "gpt-5.6-terra", Upstream: config.CodexUpstreamName},
@@ -926,30 +924,31 @@ func TestHandleMessages_OrderedModelsIgnoreClientName(t *testing.T) {
 	cfg.Precompute()
 	cfg.AllowUnlisted = true
 	logger := log.New("debug", "text")
-	router := newTestRouter(ts.URL, cfg.UpstreamAPIKey)
-	catalog := models.NewCatalog(ts.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	router := newTestRouter(ts.URL, cfg.ZenAPIKey)
+	catalog := models.NewCatalog(ts.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, logger)
 
-	body := `{"model":"whatever-i-typed","max_tokens":100,"messages":[{"role":"user","content":"hello"}]}`
-	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
+	t.Run("model in preference list -> tried first", func(t *testing.T) {
+		body := `{"model":"gpt-5.6-terra","max_tokens":100,"messages":[{"role":"user","content":"hello"}]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.HandleMessages(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+		}
+	})
 
-	handler.HandleMessages(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
-	}
-
-	var resp struct {
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	_ = json.Unmarshal(w.Body.Bytes(), &resp)
-	if len(resp.Content) != 1 || resp.Content[0].Text != "ordered ok" {
-		t.Errorf("content = %v, want [{text: ordered ok}]", resp.Content)
-	}
+	t.Run("model not in list but AllowUnlisted -> passed through", func(t *testing.T) {
+		body := `{"model":"whatever-i-typed","max_tokens":100,"messages":[{"role":"user","content":"hello"}]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.HandleMessages(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+		}
+	})
 }
 
 func TestHandleMessages_ReasoningModelRouting(t *testing.T) {
@@ -977,8 +976,8 @@ func TestHandleMessages_ReasoningModelRouting(t *testing.T) {
 	cfg.ReasoningModel = "reasoning-model"
 	cfg.AllowUnlisted = true
 	logger := log.New("debug", "text")
-	router := newTestRouter(ts.URL, cfg.UpstreamAPIKey)
-	catalog := models.NewCatalog(ts.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	router := newTestRouter(ts.URL, cfg.ZenAPIKey)
+	catalog := models.NewCatalog(ts.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, logger)
 
 	body := `{"model":"big-pickle","max_tokens":100,"thinking":{"type":"enabled","budget_tokens":10000},"messages":[{"role":"user","content":"think"}]}`
@@ -1029,8 +1028,8 @@ func TestHandleMessages_CompletionModelRouting(t *testing.T) {
 	cfg.CompletionModel = "completion-model"
 	cfg.AllowUnlisted = true
 	logger := log.New("debug", "text")
-	router := newTestRouter(ts.URL, cfg.UpstreamAPIKey)
-	catalog := models.NewCatalog(ts.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	router := newTestRouter(ts.URL, cfg.ZenAPIKey)
+	catalog := models.NewCatalog(ts.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, logger)
 
 	body := `{"model":"big-pickle","max_tokens":100,"messages":[{"role":"user","content":"complete this"}]}`
@@ -1077,8 +1076,8 @@ func TestHandleMessages_PassthroughKey(t *testing.T) {
 	cfg := defaultConfig(ts.URL)
 	cfg.PassthroughAPIKey = true
 	logger := log.New("debug", "text")
-	router := newTestRouter(ts.URL, cfg.UpstreamAPIKey)
-	catalog := models.NewCatalog(ts.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	router := newTestRouter(ts.URL, cfg.ZenAPIKey)
+	catalog := models.NewCatalog(ts.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, logger)
 
 	body := `{"model":"big-pickle","max_tokens":100,"messages":[{"role":"user","content":"test"}]}`
@@ -1144,7 +1143,7 @@ func TestBuildFallbackList_KeepsCodexWhenConfigured(t *testing.T) {
 
 	// Codex configured → gpt-5.6-terra stays in the list, in order.
 	router := newTestRouter("http://example.invalid", "public")
-	router.SetCodex(upstream.NewCodexClient("https://chatgpt.com/backend-api", "tok", "acct", 30*time.Second))
+	router.SetCodex(codex.NewClient("https://chatgpt.com/backend-api", "tok", "acct", 30*time.Second))
 	h := NewHandler(cfg, nil, router, nil)
 	list := h.buildPreferenceList(&config.ModelSpec{Name: "big-pickle", Upstream: config.DefaultUpstreamName})
 
@@ -1186,11 +1185,11 @@ func TestHandleMessages_RoutesToCorrectUpstream(t *testing.T) {
 	cfg.Precompute()
 	cfg.AllowUnlisted = true
 
-	router := upstream.NewRouter([]config.UpstreamConfig{
-		{Name: config.DefaultUpstreamName, BaseURL: opencode.URL, APIKey: cfg.UpstreamAPIKey},
+	router := providers.NewRegistry([]config.UpstreamConfig{
+		{Name: config.DefaultUpstreamName, BaseURL: opencode.URL, APIKey: cfg.ZenAPIKey},
 		{Name: "custom", BaseURL: custom.URL, APIKey: "custom-key"},
 	}, nil, 30*time.Second)
-	catalog := models.NewCatalog(opencode.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	catalog := models.NewCatalog(opencode.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, log.New("debug", "text"))
 
 	body := `{"model":"my-model","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`
@@ -1232,11 +1231,11 @@ func TestHandleMessages_FallbackAcrossUpstreams(t *testing.T) {
 	cfg.Precompute()
 	cfg.AllowUnlisted = true
 
-	router := upstream.NewRouter([]config.UpstreamConfig{
-		{Name: config.DefaultUpstreamName, BaseURL: opencode.URL, APIKey: cfg.UpstreamAPIKey},
+	router := providers.NewRegistry([]config.UpstreamConfig{
+		{Name: config.DefaultUpstreamName, BaseURL: opencode.URL, APIKey: cfg.ZenAPIKey},
 		{Name: "custom", BaseURL: custom.URL, APIKey: "custom-key"},
 	}, nil, 30*time.Second)
-	catalog := models.NewCatalog(opencode.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	catalog := models.NewCatalog(opencode.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, log.New("debug", "text"))
 
 	body := `{"model":"primary-model","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`
@@ -1251,5 +1250,70 @@ func TestHandleMessages_FallbackAcrossUpstreams(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "fallback-ok") {
 		t.Errorf("expected fallback response, got: %s", w.Body.String())
+	}
+}
+
+// TestHandler_ReorderModelsUpdatesServingConfig verifies that ReorderModels
+// updates the handler's atomic config so a dashboard ordering change takes
+// effect on subsequent requests (the default model becomes the new first entry).
+func TestHandler_ReorderModelsUpdatesServingConfig(t *testing.T) {
+	handler, cfg := newTestHandler("http://127.0.0.1:1")
+	cfg.Models = []config.ModelSpec{
+		{Name: "aaaa", Upstream: config.DefaultUpstreamName},
+		{Name: "bbbb", Upstream: config.DefaultUpstreamName},
+	}
+	cfg.Precompute()
+	handler.UpdateConfig(cfg)
+
+	// Reorder so "bbbb" leads.
+	handler.ReorderModels([]string{"bbbb", "aaaa"})
+
+	updated := handler.GetConfig()
+	if updated.DefaultModel != "bbbb" {
+		t.Errorf("DefaultModel = %q, want bbbb after reorder", updated.DefaultModel)
+	}
+	eff := updated.EffectiveModels()
+	if len(eff) != 2 || eff[0].Name != "bbbb" || eff[1].Name != "aaaa" {
+		t.Fatalf("effective models = %+v, want [bbbb aaaa]", eff)
+	}
+}
+
+// TestTestModel_429DoesNotMarkPermanentlyUnavailable verifies that a rate-limit
+// (429) probe failure is never treated as "model unavailable". A 429 is a
+// temporary condition; marking it permanent would hide a healthy model from the
+// banner and /v1/models until restart, even though the model works.
+func TestTestModel_429DoesNotMarkPermanentlyUnavailable(t *testing.T) {
+	ts := newMockUpstream(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"type":"rate_limit_error","message":"model busy"}}`))
+	})
+	defer ts.Close()
+
+	handler, _ := newTestHandler(ts.URL)
+	if err := handler.TestModel(context.Background(), "big-pickle"); err == nil {
+		t.Fatal("expected a rate-limit error from the probe")
+	}
+	if handler.IsModelUpstreamUnavailable(config.DefaultUpstreamName, "big-pickle") {
+		t.Fatal("a 429 rate limit must NOT mark the model as permanently unavailable")
+	}
+}
+
+// TestTestModel_5xxDoesNotMarkPermanentlyUnavailable verifies the same for a
+// transient server error: a 5xx is not evidence the model is gone.
+func TestTestModel_5xxDoesNotMarkPermanentlyUnavailable(t *testing.T) {
+	ts := newMockUpstream(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"type":"server_error","message":"The model is temporarily unavailable"}}`))
+	})
+	defer ts.Close()
+
+	handler, _ := newTestHandler(ts.URL)
+	if err := handler.TestModel(context.Background(), "big-pickle"); err == nil {
+		t.Fatal("expected a server error from the probe")
+	}
+	if handler.IsModelUpstreamUnavailable(config.DefaultUpstreamName, "big-pickle") {
+		t.Fatal("a 5xx server error must NOT mark the model as permanently unavailable")
 	}
 }

@@ -1,3 +1,3 @@
 module github.com/claude-code-opencode/claude-proxy
 
-go 1.26.4
+go 1.27

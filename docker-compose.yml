@@ -14,8 +14,8 @@ services:
       - claude-proxy-data:/tmp
     working_dir: /app
     environment:
-      # --- Ordered model routing ---
-      MODELS: big-pickle@opencode,deepseek-v4-flash-free@opencode
+      # Get a key from https://opencode.ai/auth (free models still require authentication).
+      ZEN_API_KEY: ${ZEN_API_KEY:?Set ZEN_API_KEY to your OpenCode Zen key}
 
       # --- Logging ---
       LOG_LEVEL: info

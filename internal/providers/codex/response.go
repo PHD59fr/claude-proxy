@@ -36,6 +36,7 @@ func TransformResponse(done *ResponsesDoneBody, requestedModel string) *anthropi
 	}
 
 	// Convert output items to content blocks
+	hasToolUse := false
 	for _, item := range done.Output {
 		switch item.Type {
 		case "message":
@@ -48,12 +49,24 @@ func TransformResponse(done *ResponsesDoneBody, requestedModel string) *anthropi
 				}
 			}
 		case "function_call":
+			callID := item.CallID
+			if callID == "" {
+				callID = item.ID
+			}
+			// Some backends omit the function_call arguments or send an empty
+			// string; Anthropic clients reject a tool_use input of null/empty,
+			// so fall back to an empty object like the streaming path does.
+			args := item.Arguments
+			if args == "" || args == "null" {
+				args = "{}"
+			}
 			resp.Content = append(resp.Content, anthropic.ContentBlock{
 				Type:  "tool_use",
-				ID:    item.ID,
+				ID:    callID,
 				Name:  item.Name,
-				Input: json.RawMessage(item.Arguments),
+				Input: json.RawMessage(args),
 			})
+			hasToolUse = true
 		}
 	}
 
@@ -64,12 +77,20 @@ func TransformResponse(done *ResponsesDoneBody, requestedModel string) *anthropi
 		}
 	}
 
-	// Map stop reason
-	switch done.Status {
-	case "completed":
-		resp.StopReason = "end_turn"
-	case "incomplete":
+	// Map stop reason. Truncation (max_output_tokens) takes precedence over tool
+	// use so the client learns the output was cut short rather than assuming the
+	// assistant finished its tool call.
+	if done.Status == "incomplete" && done.IncompleteDetails != nil && done.IncompleteDetails.Reason == "max_output_tokens" {
 		resp.StopReason = "max_tokens"
+	} else {
+		switch done.Status {
+		case "completed", "incomplete":
+			if hasToolUse {
+				resp.StopReason = "tool_use"
+			} else {
+				resp.StopReason = "end_turn"
+			}
+		}
 	}
 
 	return resp

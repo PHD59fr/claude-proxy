@@ -7,11 +7,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/claude-code-opencode/claude-proxy/internal/codex"
 	"github.com/claude-code-opencode/claude-proxy/internal/config"
 	"github.com/claude-code-opencode/claude-proxy/internal/log"
 	"github.com/claude-code-opencode/claude-proxy/internal/models"
-	"github.com/claude-code-opencode/claude-proxy/internal/upstream"
+	"github.com/claude-code-opencode/claude-proxy/internal/providers"
+	"github.com/claude-code-opencode/claude-proxy/internal/providers/codex"
 )
 
 type Server struct {
@@ -24,22 +24,8 @@ type Server struct {
 }
 
 func NewServer(cfg *config.Config, logger *log.Logger) *Server {
-	catalog := models.NewCatalog(cfg.UpstreamBaseURL, cfg.UpstreamAPIKey, cfg.ModelCacheTTL)
-
-	var codexClient *upstream.CodexClient
-	if cfg.CodexOAuthToken != "" && cfg.CodexAccountID != "" {
-		codexClient = upstream.NewCodexClient(codex.CodexBackendURL, cfg.CodexOAuthToken, cfg.CodexAccountID, cfg.RequestTimeout)
-	}
-
-	// Build the router: the built-in "opencode" upstream plus any configured
-	// additional upstreams.
-	upstreams := []config.UpstreamConfig{{
-		Name:    config.DefaultUpstreamName,
-		BaseURL: cfg.UpstreamBaseURL,
-		APIKey:  cfg.UpstreamAPIKey,
-	}}
-	upstreams = append(upstreams, cfg.Upstreams...)
-	router := upstream.NewRouter(upstreams, codexClient, cfg.RequestTimeout)
+	catalog := models.NewCatalog(cfg.ZenBaseURL, cfg.ZenAPIKey, cfg.ModelCacheTTL)
+	router := buildRegistry(cfg)
 
 	handler := NewHandler(cfg, catalog, router, logger)
 
@@ -52,6 +38,24 @@ func NewServer(cfg *config.Config, logger *log.Logger) *Server {
 		ctx:     ctx,
 		cancel:  cancel,
 	}
+}
+
+// buildRegistry assembles the provider registry from the given config: the
+// built-in "zen" upstream, any configured additional upstreams, and the
+// optional codex backend.
+func buildRegistry(cfg *config.Config) *providers.Registry {
+	var codexClient providers.Provider
+	if cfg.CodexOAuthToken != "" && cfg.CodexAccountID != "" {
+		codexClient = codex.NewClient(codex.CodexBackendURL, cfg.CodexOAuthToken, cfg.CodexAccountID, cfg.RequestTimeout)
+	}
+
+	upstreams := []config.UpstreamConfig{{
+		Name:    config.DefaultUpstreamName,
+		BaseURL: cfg.ZenBaseURL,
+		APIKey:  cfg.ZenAPIKey,
+	}}
+	upstreams = append(upstreams, cfg.Upstreams...)
+	return providers.NewRegistry(upstreams, codexClient, cfg.RequestTimeout)
 }
 
 func (s *Server) Setup() {
@@ -90,21 +94,59 @@ func (s *Server) Start() error {
 		s.Setup()
 	}
 
-	// Fetch models
-	go func() {
-		if err := s.handler.catalog.Fetch(); err != nil {
-			s.logger.Warn("failed to fetch models on startup", "error", err.Error())
-		} else {
-			s.logger.Info("models fetched successfully")
-		}
-	}()
+	// Fetch models when a service credential is available. Pure passthrough
+	// mode has no caller credential in a background goroutine.
+	if s.cfg.ZenAPIKey != "" {
+		go func() {
+			if err := s.RefreshOpenCodeModels(s.ctx); err != nil {
+				s.logger.Warn("failed to fetch models on startup", "error", err.Error())
+			} else {
+				s.logger.Info("models fetched successfully")
+			}
+		}()
+	}
+	if s.handler.loadRouter().Codex() != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+			defer cancel()
+			if err := s.RefreshCodexModels(ctx); err != nil {
+				s.logger.Warn("failed to fetch Codex models on startup", "error", err.Error())
+			}
+		}()
+	}
 
-	s.logger.Info("server starting", "addr", s.cfg.ListenAddr)
 	return s.srv.ListenAndServe()
 }
 
-func (s *Server) Client() *upstream.Client {
-	return s.handler.router.DefaultClient()
+func (s *Server) RefreshOpenCodeModels(ctx context.Context) error {
+	if err := s.handler.catalog.FetchWithContext(ctx); err != nil {
+		return err
+	}
+	s.handler.ApplyDiscoveredOpenCodeModels(s.handler.catalog.CachedModels())
+	return nil
+}
+
+func (s *Server) RefreshCodexModels(ctx context.Context) error {
+	client := s.handler.loadRouter().Codex()
+	if client == nil {
+		return nil
+	}
+	modelsClient, ok := client.(interface {
+		Models(ctx context.Context) ([]codex.ModelInfo, error)
+	})
+	if !ok {
+		return nil
+	}
+	discovered, err := modelsClient.Models(ctx)
+	if err != nil {
+		return err
+	}
+	s.handler.SetDiscoveredCodexModels(discovered)
+	return nil
+}
+
+func (s *Server) Client() providers.Provider {
+	return s.handler.loadRouter().Default()
 }
 
 func (s *Server) Catalog() *models.Catalog {
@@ -118,17 +160,8 @@ func (s *Server) Handler() *Handler {
 // RebuildRouter creates a new Router from the supplied config and publishes
 // it on the handler so subsequent requests use the new upstreams.
 func (s *Server) RebuildRouter(cfg *config.Config) {
-	var codexClient *upstream.CodexClient
-	if cfg.CodexOAuthToken != "" && cfg.CodexAccountID != "" {
-		codexClient = upstream.NewCodexClient(codex.CodexBackendURL, cfg.CodexOAuthToken, cfg.CodexAccountID, cfg.RequestTimeout)
-	}
-	upstreams := []config.UpstreamConfig{{
-		Name:    config.DefaultUpstreamName,
-		BaseURL: cfg.UpstreamBaseURL,
-		APIKey:  cfg.UpstreamAPIKey,
-	}}
-	upstreams = append(upstreams, cfg.Upstreams...)
-	s.handler.router = upstream.NewRouter(upstreams, codexClient, cfg.RequestTimeout)
+	s.handler.replaceRouter(buildRegistry(cfg))
+	s.handler.catalog.Reconfigure(cfg.ZenBaseURL, cfg.ZenAPIKey, cfg.ModelCacheTTL)
 }
 
 // StartTokenRefresh starts a background goroutine that refreshes Codex tokens.
@@ -170,8 +203,10 @@ func (s *Server) StartTokenRefresh() {
 			if err := codex.SaveTokens(refreshed); err != nil {
 				s.logger.Warn("failed to save refreshed token", "error", err.Error())
 			}
-			if client := s.handler.router.Codex(); client != nil {
-				client.UpdateToken(refreshed.AccessToken)
+			if client := s.handler.loadRouter().Codex(); client != nil {
+				if c, ok := client.(interface{ UpdateToken(token string) }); ok {
+					c.UpdateToken(refreshed.AccessToken)
+				}
 			}
 			s.logger.Info("codex token refreshed",
 				"expires", time.UnixMilli(refreshed.ExpiresAt).Format(time.RFC3339),
@@ -237,12 +272,19 @@ func (s *Server) reloadConfig(configPath string) {
 
 	// Publish a fully initialized client so in-flight requests retain their
 	// existing client while later requests observe the new credentials.
-	s.handler.router.SetCodex(upstream.NewCodexClient(
+	s.handler.loadRouter().SetCodex(codex.NewClient(
 		codex.CodexBackendURL,
 		cfg.CodexOAuthToken,
 		cfg.CodexAccountID,
 		s.cfg.RequestTimeout,
 	))
+	go func() {
+		ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+		defer cancel()
+		if err := s.RefreshCodexModels(ctx); err != nil {
+			s.logger.Warn("failed to refresh Codex models after login", "error", err.Error())
+		}
+	}()
 	// Invalidate the token cache so the refresh goroutine reads the new
 	// credentials from disk instead of using stale in-memory tokens.
 	codex.InvalidateTokenCache()

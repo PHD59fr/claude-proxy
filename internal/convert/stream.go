@@ -352,11 +352,15 @@ func (sc *StreamConverter) writeToolUseBlockStart(blockIdx int, id, name string)
 }
 
 func (sc *StreamConverter) writeTextDelta(text string) error {
-	// The text block lives at index blockIdx-1. ensureTextBlock opens it before
-	// any delta is written; guard against a stray call so we never emit a
-	// negative or wrong index if the contract is violated.
-	if !sc.textOpen || sc.blockIdx == 0 {
-		return fmt.Errorf("writeTextDelta called without an open text block")
+	// The text block lives at index blockIdx-1. Convert normally opens it via
+	// ensureTextBlock before any delta is written; guard defensively against a
+	// stray call by opening the block on the fly, so a delta that arrives
+	// without an open text block degrades gracefully instead of aborting the
+	// whole stream.
+	if !sc.textOpen {
+		if err := sc.ensureTextBlock(); err != nil {
+			return err
+		}
 	}
 	delta := anthropic.SSEContentBlockDelta{
 		Type:  "content_block_delta",

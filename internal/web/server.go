@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -80,6 +81,19 @@ func (s *Server) authorized(r *http.Request) bool {
 	if strings.HasPrefix(token, "Bearer ") {
 		return s.validKey(strings.TrimPrefix(token, "Bearer "))
 	}
+	// Support HTTP Basic Auth (like .htaccess) for browser login prompt
+	if strings.HasPrefix(token, "Basic ") {
+		encoded := strings.TrimPrefix(token, "Basic ")
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err == nil {
+			// Expect format: "user:key" or just "key" (password only)
+			parts := strings.SplitN(string(decoded), ":", 2)
+			if len(parts) == 2 {
+				return s.validKey(parts[1])
+			}
+			return s.validKey(string(decoded))
+		}
+	}
 	if cookie, err := r.Cookie("claude_proxy_web_key"); err == nil {
 		return s.validKey(cookie.Value)
 	}
@@ -89,7 +103,7 @@ func (s *Server) authorized(r *http.Request) bool {
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.authorized(r) {
-			w.Header().Set("WWW-Authenticate", "Bearer")
+			w.Header().Set("WWW-Authenticate", `Basic realm="claude-proxy"`)
 			http.Error(w, "web interface authentication required", http.StatusUnauthorized)
 			return
 		}
@@ -188,8 +202,8 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"max_body_size":       fieldInfo{Value: cfg.MaxBodySize, Source: cfg.Sources["max_body_size"]},
 		"log_level":           fieldInfo{Value: cfg.LogLevel, Source: cfg.Sources["log_level"]},
 		"log_format":          fieldInfo{Value: cfg.LogFormat, Source: cfg.Sources["log_format"]},
-		"upstream_base_url":   fieldInfo{Value: cfg.UpstreamBaseURL, Source: cfg.Sources["upstream_base_url"]},
-		"upstream_api_key":    secretStatus{Configured: cfg.UpstreamAPIKey != "", WriteOnly: true, Source: cfg.Sources["upstream_api_key"]},
+		"zen_base_url":        fieldInfo{Value: cfg.ZenBaseURL, Source: cfg.Sources["zen_base_url"]},
+		"zen_api_key":         secretStatus{Configured: cfg.ZenAPIKey != "" && cfg.ZenAPIKey != "public", WriteOnly: true, Source: cfg.Sources["zen_api_key"]},
 		"inbound_api_key":     secretStatus{Configured: cfg.InboundAPIKey != "", WriteOnly: true, Source: cfg.Sources["inbound_api_key"]},
 		"web_interface_key":   secretStatus{Configured: cfg.WebInterfaceKey != "", WriteOnly: true, Source: cfg.Sources["web_interface_key"]},
 		"codex_account_id":    fieldInfo{Value: cfg.CodexAccountID, Source: cfg.Sources["codex_account_id"]},
@@ -289,6 +303,7 @@ func (s *Server) handleTestModel(w http.ResponseWriter, r *http.Request) {
 // ─── DefaultProvider wraps the proxy handler ────────────────────────────────
 
 type DefaultProvider struct {
+	cfgMu         sync.RWMutex
 	cfg           *config.Config
 	version       string
 	handlerProbe  func(ctx context.Context, name string) error
@@ -296,6 +311,7 @@ type DefaultProvider struct {
 	resetBreakers func()
 	saveConfig    func(config.FileConfig) error
 	persistConfig func(*config.Config) error // persists full config to disk
+	reorderModels func([]string) error       // updates runtime model order
 	codexLogin    func() (string, error)
 	loginMu       sync.Mutex
 	loginStatus   string // "idle", "pending", "completed", "error"
@@ -316,8 +332,24 @@ func (p *DefaultProvider) SetPersistConfig(fn func(*config.Config) error) {
 	p.persistConfig = fn
 }
 
+// SetReorderModels sets a callback that applies a new ordered model list to the
+// running proxy (and, if needed, persists it). When set, ReorderModels delegates
+// to it so an order change from the dashboard takes effect immediately on the
+// runtime handler instead of only after a restart.
+func (p *DefaultProvider) SetReorderModels(fn func([]string) error) {
+	p.reorderModels = fn
+}
+
 func (p *DefaultProvider) GetConfig() *config.Config {
+	p.cfgMu.RLock()
+	defer p.cfgMu.RUnlock()
 	return p.cfg
+}
+
+func (p *DefaultProvider) SetConfig(cfg *config.Config) {
+	p.cfgMu.Lock()
+	p.cfg = cfg
+	p.cfgMu.Unlock()
 }
 
 func (p *DefaultProvider) GetVersion() string {
@@ -408,6 +440,16 @@ func (p *DefaultProvider) SetLoginError(msg string) {
 }
 
 func (p *DefaultProvider) ReorderModels(names []string) {
+	// When a reorder callback is configured, delegate to it so the runtime
+	// handler (and its atomic config pointer) is updated immediately. This is
+	// the wired path in main.go; the local implementation below is kept as a
+	// fallback for callers (e.g. tests) that do not wire a callback.
+	if p.reorderModels != nil {
+		_ = p.reorderModels(names)
+		return
+	}
+	p.cfgMu.Lock()
+	defer p.cfgMu.Unlock()
 	var newModels []config.ModelSpec
 	seen := make(map[string]bool)
 	for _, name := range names {

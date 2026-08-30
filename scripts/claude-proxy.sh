@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #
-# Launch Claude Code with OpenCode free models via the proxy.
+# Launch Claude Code with OpenCode free models via the proxy. The proxy must
+# already be configured with an OpenCode Zen API key.
 #
 # Usage:
 #   ./scripts/claude-proxy.sh [model] [extra claude args...]
 #
 # Examples:
 #   ./scripts/claude-proxy.sh big-pickle
-#   ./scripts/claude-proxy.sh deepseek-v4-flash-free --verbose
+#   ./scripts/claude-proxy.sh nemotron-3.5-lightning-free --verbose
 #
 # The proxy must be running on http://127.0.0.1:3000
 #
