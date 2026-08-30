@@ -307,6 +307,32 @@ func TestParseCodexStream_EmptyStream(t *testing.T) {
 	}
 }
 
+func TestParseResponsesStream_RequiresTerminalEvent(t *testing.T) {
+	ch := ParseResponsesStreamWithTimeout(context.Background(), strings.NewReader(""), time.Second)
+	chunk, ok := <-ch
+	if !ok || chunk.Err == nil {
+		t.Fatal("expected truncated Responses stream error")
+	}
+}
+
+func TestParseResponsesStream_AcceptsCompletedEvent(t *testing.T) {
+	input := "event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp","status":"completed"}}` + "\n\n"
+	ch := ParseResponsesStreamWithTimeout(context.Background(), strings.NewReader(input), time.Second)
+	var done *ResponsesDoneBody
+	for chunk := range ch {
+		if chunk.Err != nil {
+			t.Fatal(chunk.Err)
+		}
+		if chunk.Done != nil {
+			done = chunk.Done
+		}
+	}
+	if done == nil || done.ID != "resp" {
+		t.Fatalf("missing completed response: %+v", done)
+	}
+}
+
 func TestParseCodexStream_ContextCancellation(t *testing.T) {
 	sr := newStallReader()
 	ctx, cancel := context.WithCancel(context.Background())

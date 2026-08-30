@@ -10,3 +10,7 @@
 .claude/worktrees/
 config.json
 !config.example.json
+
+# Local Go build cache / toolchain environment (never commit)
+.cache/
+.config/

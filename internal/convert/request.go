@@ -35,15 +35,11 @@ func Request(req *anthropic.MessageRequest, defaultModel string) (*openai.ChatCo
 		}
 	}
 
-	// System message
+	// System message: extract it to prepend to the first user message
+	// since many models don't support the "system" role.
+	var systemText string
 	if len(req.System) > 0 {
-		systemText := extractSystemPrompt(req.System)
-		if systemText != "" {
-			oai.Messages = append(oai.Messages, openai.ChatMessage{
-				Role:    "system",
-				Content: systemText,
-			})
-		}
+		systemText = extractSystemPrompt(req.System)
 	}
 
 	// Stop sequences
@@ -52,15 +48,25 @@ func Request(req *anthropic.MessageRequest, defaultModel string) (*openai.ChatCo
 	}
 
 	// Convert messages
+	systemPrepended := false
 	for i, msg := range req.Messages {
 		if err := validateMessage(&msg); err != nil {
 			return nil, fmt.Errorf("messages[%d]: %w", i, err)
 		}
-		oaiMsgs, err := convertMessage(&msg)
+		oaiMsgs, err := convertMessage(&msg, &systemText, &systemPrepended)
 		if err != nil {
 			return nil, fmt.Errorf("convert message: %w", err)
 		}
 		oai.Messages = append(oai.Messages, oaiMsgs...)
+	}
+
+	// If there were no user messages to prepend the system prompt to,
+	// add it as a user message.
+	if systemText != "" && !systemPrepended {
+		oai.Messages = append(oai.Messages, openai.ChatMessage{
+			Role:    "user",
+			Content: systemText,
+		})
 	}
 
 	// Convert tools
@@ -114,7 +120,7 @@ func extractSystemPrompt(raw json.RawMessage) string {
 }
 
 func validateMessage(msg *anthropic.Message) error {
-	if msg.Role != "user" && msg.Role != "assistant" {
+	if msg.Role != "user" && msg.Role != "assistant" && msg.Role != "system" {
 		return fmt.Errorf("role %q is not supported", msg.Role)
 	}
 	for i, part := range msg.Content.Parts {
@@ -131,7 +137,7 @@ func validateMessage(msg *anthropic.Message) error {
 	return nil
 }
 
-func convertMessage(msg *anthropic.Message) ([]openai.ChatMessage, error) {
+func convertMessage(msg *anthropic.Message, systemText *string, systemPrepended *bool) ([]openai.ChatMessage, error) {
 	var result []openai.ChatMessage
 
 	// Handle tool_result messages - these go as "tool" role
@@ -196,6 +202,15 @@ func convertMessage(msg *anthropic.Message) ([]openai.ChatMessage, error) {
 			}
 			text = strings.Join(texts, "\n")
 		}
+		// Prepend system prompt to the first user message
+		if *systemText != "" && !*systemPrepended {
+			if text != "" {
+				text = *systemText + "\n\n" + text
+			} else {
+				text = *systemText
+			}
+			*systemPrepended = true
+		}
 		if len(images) > 0 {
 			// Multimodal content
 			oaiParts := make([]interface{}, 0)
@@ -234,6 +249,26 @@ func convertMessage(msg *anthropic.Message) ([]openai.ChatMessage, error) {
 			oaiMsg.Content = text
 		}
 		result = append(result, oaiMsg)
+
+	case "system":
+		// Convert system role messages to be prepended to the first user message
+		// since many models don't support the "system" role.
+		text := ""
+		for _, p := range regularParts {
+			if p.Type == "text" {
+				if text != "" {
+					text += "\n"
+				}
+				text += p.Text
+			}
+		}
+		if text != "" {
+			if *systemText != "" {
+				*systemText = *systemText + "\n\n" + text
+			} else {
+				*systemText = text
+			}
+		}
 	}
 
 	return result, nil

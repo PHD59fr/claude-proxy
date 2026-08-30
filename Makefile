@@ -3,7 +3,7 @@ BINARY  := claude-proxy
 GOFLAGS := -trimpath
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build test test-race vet fmt clean docker
+.PHONY: all build test test-race vet fmt fmt-check clean docker docker-run docker-run-debug docker-run-passthrough install
 
 all: build
 
@@ -33,21 +33,20 @@ docker:
 
 docker-run:
 	docker run --rm -p 127.0.0.1:3000:3000 \
-		-e UPSTREAM_BASE_URL=https://opencode.ai/zen/v1 \
-		-e UPSTREAM_API_KEY=public \
-		-e DEFAULT_MODEL=big-pickle \
+		-e ZEN_BASE_URL=https://opencode.ai/zen/v1 \
+		-e ZEN_API_KEY="$${ZEN_API_KEY:?Set ZEN_API_KEY to your OpenCode Zen key}" \
 		$(BINARY):$(VERSION)
 
 docker-run-debug:
 	docker run --rm -p 127.0.0.1:3000:3000 \
-		-e UPSTREAM_BASE_URL=https://opencode.ai/zen/v1 \
-		-e UPSTREAM_API_KEY=public \
+		-e ZEN_BASE_URL=https://opencode.ai/zen/v1 \
+		-e ZEN_API_KEY="$${ZEN_API_KEY:?Set ZEN_API_KEY to your OpenCode Zen key}" \
 		-e DEBUG=true \
 		$(BINARY):$(VERSION)
 
 docker-run-passthrough:
 	docker run --rm -p 0.0.0.0:3000:3000 \
-		-e UPSTREAM_BASE_URL=https://openrouter.ai/api \
+		-e ZEN_BASE_URL=https://openrouter.ai/api \
 		-e UPSTREAM_API_KEY_PASSTHROUGH=true \
 		-e ALLOW_UNLISTED_MODELS=true \
 		$(BINARY):$(VERSION)

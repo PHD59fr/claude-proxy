@@ -64,14 +64,19 @@ func TestRequest_SystemPrompt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(oai.Messages) != 2 {
-		t.Fatalf("messages = %d, want 2", len(oai.Messages))
+	if len(oai.Messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(oai.Messages))
 	}
-	if oai.Messages[0].Role != "system" {
-		t.Errorf("first message role = %q, want system", oai.Messages[0].Role)
+	if oai.Messages[0].Role != "user" {
+		t.Errorf("first message role = %q, want user", oai.Messages[0].Role)
 	}
-	if oai.Messages[0].Content != "You are a helpful assistant" {
-		t.Errorf("system content = %q", oai.Messages[0].Content)
+	content, ok := oai.Messages[0].Content.(string)
+	if !ok {
+		t.Fatalf("content is not string: %T", oai.Messages[0].Content)
+	}
+	expected := "You are a helpful assistant\n\nHello"
+	if content != expected {
+		t.Errorf("content = %q, want %q", content, expected)
 	}
 }
 
@@ -97,15 +102,85 @@ func TestRequest_SystemPromptAsBlocks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if oai.Messages[0].Role != "system" {
-		t.Errorf("first message role = %q, want system", oai.Messages[0].Role)
+	if len(oai.Messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(oai.Messages))
+	}
+	if oai.Messages[0].Role != "user" {
+		t.Errorf("first message role = %q, want user", oai.Messages[0].Role)
 	}
 	content, ok := oai.Messages[0].Content.(string)
 	if !ok {
-		t.Fatalf("system content is not string: %T", oai.Messages[0].Content)
+		t.Fatalf("content is not string: %T", oai.Messages[0].Content)
 	}
-	if content != "System part 1\nSystem part 2" {
-		t.Errorf("system content = %q", content)
+	expected := "System part 1\nSystem part 2\n\nHello"
+	if content != expected {
+		t.Errorf("content = %q, want %q", content, expected)
+	}
+}
+
+func TestRequest_SystemRoleInMessages(t *testing.T) {
+	req := &anthropic.MessageRequest{
+		Model: "big-pickle",
+		Messages: []anthropic.Message{
+			{
+				Role:    "system",
+				Content: anthropic.MessageContent{Parts: []anthropic.ContentBlock{{Type: "text", Text: "System instruction"}}},
+			},
+			{
+				Role:    "user",
+				Content: anthropic.MessageContent{Parts: []anthropic.ContentBlock{{Type: "text", Text: "Hello"}}},
+			},
+		},
+		MaxTokens: 100,
+	}
+
+	oai, err := Request(req, "big-pickle")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(oai.Messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(oai.Messages))
+	}
+	if oai.Messages[0].Role != "user" {
+		t.Errorf("first message role = %q, want user", oai.Messages[0].Role)
+	}
+	content, ok := oai.Messages[0].Content.(string)
+	if !ok {
+		t.Fatalf("content is not string: %T", oai.Messages[0].Content)
+	}
+	expected := "System instruction\n\nHello"
+	if content != expected {
+		t.Errorf("content = %q, want %q", content, expected)
+	}
+}
+
+func TestRequest_SystemPromptNoUserMessage(t *testing.T) {
+	sysJSON, _ := json.Marshal("You are a helpful assistant")
+	req := &anthropic.MessageRequest{
+		Model:     "big-pickle",
+		System:    sysJSON,
+		Messages:  []anthropic.Message{},
+		MaxTokens: 100,
+	}
+
+	oai, err := Request(req, "big-pickle")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(oai.Messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(oai.Messages))
+	}
+	if oai.Messages[0].Role != "user" {
+		t.Errorf("first message role = %q, want user", oai.Messages[0].Role)
+	}
+	content, ok := oai.Messages[0].Content.(string)
+	if !ok {
+		t.Fatalf("content is not string: %T", oai.Messages[0].Content)
+	}
+	if content != "You are a helpful assistant" {
+		t.Errorf("content = %q, want 'You are a helpful assistant'", content)
 	}
 }
 

@@ -28,7 +28,12 @@ jobs:
           cache: true
       - uses: golangci/golangci-lint-action@v7
         with:
-          version: v2.11.1
+          #
+          # v2.13.2 is built with Go 1.27, matching go.mod's `go 1.27`.
+          # Earlier releases (e.g. v2.11.1, built with Go 1.26) abort with
+          # "the Go language version used to build golangci-lint is lower than
+          # the targeted Go version (1.27)".
+          version: v2.13.2
           args: --timeout=5m
 
   test:
@@ -125,7 +130,10 @@ jobs:
         if: github.ref != 'refs/heads/master' && github.event_name != 'schedule'
         run: |
           image="${{ env.IMAGE_NAME }}:latest"
-          docker run -d --rm --name claude-proxy-smoke -p 3000:3000 "$image"
+          docker run -d --rm --name claude-proxy-smoke -p 3000:3000 \
+            -e MODELS=smoke-model@smoke \
+            -e 'UPSTREAMS=[{"name":"smoke","base_url":"http://127.0.0.1:9/v1","api_key":""}]' \
+            "$image"
           trap 'docker logs claude-proxy-smoke; docker stop claude-proxy-smoke || true' EXIT
           for i in $(seq 1 20); do
             docker exec claude-proxy-smoke /app/claude-proxy healthcheck && exit 0

@@ -102,6 +102,19 @@ func TestTransformResponse_ToolCalls(t *testing.T) {
 	}
 }
 
+func TestTransformResponse_PrefersCallID(t *testing.T) {
+	done := &ResponsesDoneBody{Status: "completed", Output: []OutputItem{{
+		Type: "function_call", ID: "item_1", CallID: "call_1", Name: "tool", Arguments: `{}`,
+	}}}
+	resp := TransformResponse(done, "model")
+	if resp.Content[0].ID != "call_1" {
+		t.Fatalf("tool ID = %q, want call_1", resp.Content[0].ID)
+	}
+	if resp.StopReason != "tool_use" {
+		t.Fatalf("stop reason = %q, want tool_use", resp.StopReason)
+	}
+}
+
 func TestTransformResponse_Empty(t *testing.T) {
 	done := &ResponsesDoneBody{
 		ID:     "resp_empty",
@@ -166,8 +179,9 @@ func TestTransformResponse_Usage(t *testing.T) {
 
 func TestTransformResponse_IncompleteStatus(t *testing.T) {
 	done := &ResponsesDoneBody{
-		ID:     "resp_inc",
-		Status: "incomplete",
+		ID:                "resp_inc",
+		Status:            "incomplete",
+		IncompleteDetails: &IncompleteDetails{Reason: "max_output_tokens"},
 		Output: []OutputItem{
 			{
 				Type: "message",

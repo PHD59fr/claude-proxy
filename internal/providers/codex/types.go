@@ -2,19 +2,25 @@ package codex
 
 import (
 	"encoding/json"
+	"sort"
 	"strings"
 )
 
 // ResponsesRequest is the OpenAI Responses API request format used by the Codex backend.
 type ResponsesRequest struct {
-	Model        string          `json:"model"`
-	Input        []InputItem     `json:"input,omitempty"`
-	Instructions string          `json:"instructions,omitempty"`
-	Tools        []ResponsesTool `json:"tools,omitempty"`
-	Store        bool            `json:"store"`
-	Stream       bool            `json:"stream"`
-	Reasoning    *Reasoning      `json:"reasoning,omitempty"`
-	Include      []string        `json:"include,omitempty"`
+	Model             string          `json:"model"`
+	Input             []InputItem     `json:"input,omitempty"`
+	Instructions      string          `json:"instructions,omitempty"`
+	Tools             []ResponsesTool `json:"tools,omitempty"`
+	Store             bool            `json:"store"`
+	Stream            bool            `json:"stream"`
+	MaxOutputTokens   int             `json:"max_output_tokens,omitempty"`
+	Temperature       *float64        `json:"temperature,omitempty"`
+	TopP              *float64        `json:"top_p,omitempty"`
+	ToolChoice        interface{}     `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool           `json:"parallel_tool_calls,omitempty"`
+	Reasoning         *Reasoning      `json:"reasoning,omitempty"`
+	Include           []string        `json:"include,omitempty"`
 }
 
 // Reasoning controls extended thinking behavior for Codex models.
@@ -85,10 +91,15 @@ type ResponsesEvent struct {
 
 // ResponsesDoneBody is the response payload in a response.done event.
 type ResponsesDoneBody struct {
-	ID     string       `json:"id"`
-	Status string       `json:"status"`
-	Output []OutputItem `json:"output,omitempty"`
-	Usage  *Usage       `json:"usage,omitempty"`
+	ID                string             `json:"id"`
+	Status            string             `json:"status"`
+	Output            []OutputItem       `json:"output,omitempty"`
+	Usage             *Usage             `json:"usage,omitempty"`
+	IncompleteDetails *IncompleteDetails `json:"incomplete_details,omitempty"`
+}
+
+type IncompleteDetails struct {
+	Reason string `json:"reason,omitempty"`
 }
 
 // ResponseDelta is a text delta in a response.output_text.delta event.
@@ -123,31 +134,38 @@ type Usage struct {
 	TotalTokens  int `json:"total_tokens,omitempty"`
 }
 
-// --- Canonical Codex model names ---
-
-const (
-	ModelGPT54      = "gpt-5.4"
-	ModelGPT54Mini  = "gpt-5.4-mini"
-	ModelGPT56      = "gpt-5.6"
-	ModelGPT56Sol   = "gpt-5.6-sol"
-	ModelGPT56Terra = "gpt-5.6-terra"
-	ModelGPT56Luna  = "gpt-5.6-luna"
-)
-
 // CodexBackendURL is the base URL for the ChatGPT Codex backend.
 const CodexBackendURL = "https://chatgpt.com/backend-api"
 
 // CodexPath is the API path for Codex requests.
 const CodexPath = "/codex/responses"
 
-// KnownCodexModels is the set of canonical Codex model names.
-var KnownCodexModels = map[string]bool{
-	ModelGPT54:      true,
-	ModelGPT54Mini:  true,
-	ModelGPT56:      true,
-	ModelGPT56Sol:   true,
-	ModelGPT56Terra: true,
-	ModelGPT56Luna:  true,
+const CodexClientVersion = "0.144.1"
+
+type ModelsResponse struct {
+	Models []ModelInfo `json:"models"`
+}
+
+// ModelInfo is the subset of Codex's account-scoped model metadata used by
+// the proxy. Unknown response fields are intentionally ignored.
+type ModelInfo struct {
+	Slug           string `json:"slug"`
+	DisplayName    string `json:"display_name"`
+	Description    string `json:"description"`
+	Visibility     string `json:"visibility"`
+	SupportedInAPI bool   `json:"supported_in_api"`
+	Priority       int    `json:"priority"`
+}
+
+func VisibleModels(models []ModelInfo) []ModelInfo {
+	visible := make([]ModelInfo, 0, len(models))
+	for _, model := range models {
+		if model.Slug != "" && model.Visibility == "list" {
+			visible = append(visible, model)
+		}
+	}
+	sort.SliceStable(visible, func(i, j int) bool { return visible[i].Priority < visible[j].Priority })
+	return visible
 }
 
 // ParseResponsesEvent parses a single SSE data line into a ResponsesEvent.
@@ -157,11 +175,6 @@ func ParseResponsesEvent(data string) (*ResponsesEvent, error) {
 		return nil, err
 	}
 	return &event, nil
-}
-
-// IsCodexModel checks if a model name is a known Codex model.
-func IsCodexModel(model string) bool {
-	return KnownCodexModels[model]
 }
 
 // FindDoneBody returns the last response event that carries a populated

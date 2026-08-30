@@ -349,3 +349,27 @@ func TestTransformRequest_ToolDefinition(t *testing.T) {
 		t.Fatal("tools[0].Parameters is nil")
 	}
 }
+
+func TestTransformResponsesRequest_PreservesStandardFields(t *testing.T) {
+	req := &anthropic.MessageRequest{
+		Model:     "muse-spark-1.2-contributor-free",
+		MaxTokens: 321,
+		Stream:    false,
+		Messages: []anthropic.Message{{
+			Role: "assistant",
+			Content: anthropic.MessageContent{Parts: []anthropic.ContentBlock{{
+				Type: "tool_use", ID: "call_original", Name: "lookup", Input: json.RawMessage(`{"q":"x"}`),
+			}}},
+		}},
+	}
+	out, err := TransformResponsesRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Model != req.Model || out.Stream || out.MaxOutputTokens != 321 {
+		t.Fatalf("unexpected Responses request: %+v", out)
+	}
+	if len(out.Input) != 1 || out.Input[0].CallID != "call_original" || out.Input[0].ID != "call_original" {
+		t.Fatalf("tool call ID was not preserved: %+v", out.Input)
+	}
+}

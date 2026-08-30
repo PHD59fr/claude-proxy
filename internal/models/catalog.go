@@ -19,16 +19,6 @@ type ModelEntry struct {
 	Extra   map[string]interface{} `json:"-"`
 }
 
-// DefaultModels is the bundled fallback list.
-var DefaultModels = []ModelEntry{
-	{ID: "big-pickle", Object: "model", OwnedBy: "opencode"},
-	{ID: "deepseek-v4-flash-free", Object: "model", OwnedBy: "opencode"},
-	{ID: "hy3-free", Object: "model", OwnedBy: "opencode"},
-	{ID: "mimo-v2.5-free", Object: "model", OwnedBy: "opencode"},
-	{ID: "nemotron-3-ultra-free", Object: "model", OwnedBy: "opencode"},
-	{ID: "north-mini-code-free", Object: "model", OwnedBy: "opencode"},
-}
-
 // Catalog manages the upstream model list with caching.
 type Catalog struct {
 	mu          sync.RWMutex
@@ -48,8 +38,17 @@ func NewCatalog(upstreamURL, apiKey string, cacheTTL time.Duration) *Catalog {
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		models: DefaultModels,
 	}
+}
+
+// CachedModels returns the last successfully fetched catalog without causing
+// network I/O.
+func (c *Catalog) CachedModels() []ModelEntry {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	result := make([]ModelEntry, len(c.models))
+	copy(result, c.models)
+	return result
 }
 
 type upstreamModelsResponse struct {
@@ -62,13 +61,16 @@ func (c *Catalog) Fetch() error {
 
 // FetchWithContext fetches the model list from upstream with a context for cancellation.
 func (c *Catalog) FetchWithContext(ctx context.Context) error {
-	url := c.upstreamURL + "/models"
+	c.mu.RLock()
+	upstreamURL, apiKey := c.upstreamURL, c.apiKey
+	c.mu.RUnlock()
+	url := upstreamURL + "/models"
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return err
 	}
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -103,6 +105,20 @@ func (c *Catalog) FetchWithContext(ctx context.Context) error {
 	return nil
 }
 
+// Reconfigure updates the remote catalog settings and invalidates the cache.
+// The cached model list is cleared too, so a switch to a different upstream does
+// not keep serving the previous provider's stale catalog if the new one is
+// temporarily unreachable (Fetch only overwrites models when non-empty).
+func (c *Catalog) Reconfigure(upstreamURL, apiKey string, cacheTTL time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.upstreamURL = strings.TrimRight(upstreamURL, "/")
+	c.apiKey = apiKey
+	c.cacheTTL = cacheTTL
+	c.lastFetch = time.Time{}
+	c.models = nil
+}
+
 func (c *Catalog) GetModels(forceRefresh bool) []ModelEntry {
 	c.mu.RLock()
 	if !forceRefresh && time.Since(c.lastFetch) < c.cacheTTL {
@@ -121,8 +137,8 @@ func (c *Catalog) GetModels(forceRefresh bool) []ModelEntry {
 	return models
 }
 
-// FilteredModels returns models filtered by the default criteria.
-// big-pickle is always included, plus any model ending in -free.
+// FilteredModels derives the current free Zen set from the remote catalog.
+// big-pickle is the one free model whose ID does not carry the -free suffix.
 func FilteredModels(models []ModelEntry) []ModelEntry {
 	var filtered []ModelEntry
 	seen := make(map[string]bool)

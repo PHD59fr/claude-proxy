@@ -1,4 +1,4 @@
-package upstream
+package codex
 
 import (
 	"context"
@@ -20,7 +20,7 @@ func TestCodexClientConcurrentTokenUpdates(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewCodexClient(server.URL, "initial", "account", time.Second)
+	client := NewClient(server.URL, "initial", "account", time.Second)
 	const requests = 50
 
 	var wg sync.WaitGroup
@@ -39,24 +39,6 @@ func TestCodexClientConcurrentTokenUpdates(t *testing.T) {
 	}
 	for i := 0; i < requests; i++ {
 		client.UpdateToken("rotated-token")
-	}
-	wg.Wait()
-}
-
-func TestRouterConcurrentCodexPublication(t *testing.T) {
-	router := NewRouter(nil, nil, time.Second)
-	const updates = 100
-
-	var wg sync.WaitGroup
-	for i := 0; i < updates; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_ = router.Codex()
-		}()
-	}
-	for i := 0; i < updates; i++ {
-		router.SetCodex(&CodexClient{})
 	}
 	wg.Wait()
 }

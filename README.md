@@ -33,13 +33,13 @@ flowchart TD
     CC -->|POST /v1/messages| PROXY["claude-proxy (this binary)"]
 
     subgraph Proxy["claude-proxy internals"]
-        RES["1. Resolution<br/>any client model name → DefaultModel = big-pickle"]
-        FB["2. Fallback chain<br/>models[] in priority order:<br/>big-pickle@opencode → gpt-5.6-terra@codex → …"]
+        RES["1. Resolution<br/>any client model name → first models[] entry<br/>(configured or auto-discovered free model)"]
+        FB["2. Fallback chain<br/>models[] in priority order:<br/>first@zen → next@codex → …"]
         RT["3. Routing by upstream<br/>spec.Upstream → backend"]
         RES --> FB --> RT
     end
 
-    RT -->|"@opencode"| OC["OpenCode<br/>/zen/v1<br/>(hardcoded default)"]
+    RT -->|"@zen"| OC["OpenCode Zen<br/>/zen/v1<br/>API key required"]
     RT -->|"@codex"| CX["Codex (OpenAI)<br/>OAuth ChatGPT<br/>(gpt-5.6-*)"]
     RT -->|"@custom"| CU["Custom upstream<br/>user base_url<br/>(OpenRouter, local, …)"]
 
@@ -51,20 +51,24 @@ flowchart TD
 **Key points:**
 - The model name sent by the client is **opaque**: the proxy always walks its `models[]` list in order.
 - Each `models[]` entry carries an `upstream` field that decides which backend receives the request.
-- Fallback can **span upstreams** (e.g. `big-pickle` fails on opencode → `gpt-5.6-terra` is sent to codex).
-- `opencode` is always present (default); `codex` is used when OAuth is configured; `custom` is whatever you add to `upstreams[]`.
+- Fallback can **span upstreams** (e.g. the first `models[]` entry fails on zen → the next Codex entry is sent to codex).
+- `zen` is always present (default) and requires a Zen API key; `codex` is used when OAuth is configured; `custom` is whatever you add to `upstreams[]`.
 
 ## ⚡ Quick Start
 
 ### Option 1  - Docker (recommended)
 
 ```bash
-# Minimal: nothing to configure — OpenCode is the hardcoded default
-docker run --rm -p 127.0.0.1:3000:3000 phd59fr/claude-proxy:latest
+# Create a Zen API key at https://opencode.ai/auth, then start the proxy.
+export ZEN_API_KEY="your-zen-key"
+docker run --rm -p 127.0.0.1:3000:3000 \
+  -e ZEN_API_KEY="$ZEN_API_KEY" \
+  phd59fr/claude-proxy:latest
 
 # Multi-upstream example (models list with explicit upstreams)
 docker run --rm -p 127.0.0.1:3000:3000 \
-  -e MODELS='[{"name":"big-pickle","upstream":"opencode"},{"name":"gpt-5.6-terra","upstream":"codex"}]' \
+  -e ZEN_API_KEY="$ZEN_API_KEY" \
+  -e MODELS='[{"name":"big-pickle","upstream":"zen"},{"name":"gpt-5.6-terra","upstream":"codex"}]' \
   -e UPSTREAMS='[{"name":"openrouter","base_url":"https://openrouter.ai/api","api_key":"sk-or-..."}]' \
   phd59fr/claude-proxy:latest
 ```
@@ -75,7 +79,7 @@ docker run --rm -p 127.0.0.1:3000:3000 \
 git clone https://github.com/PHD59fr/claude-proxy.git
 cd claude-proxy
 make build
-./claude-proxy serve
+ZEN_API_KEY="$ZEN_API_KEY" ./claude-proxy serve
 ```
 
 If a `config.json` exists in the current directory, it's loaded automatically.
@@ -86,8 +90,8 @@ If a `config.json` exists in the current directory, it's loaded automatically.
 # Step 1: Authenticate with ChatGPT (opens browser)
 ./claude-proxy codex-login
 
-# Step 2: Start the proxy
-./claude-proxy serve
+# Step 2: Start the proxy with a Codex-only route (no Zen key required)
+MODELS=gpt-5.6-sol@codex ./claude-proxy serve
 
 # Step 3: Use with Claude Code
 ./scripts/claude-codex.sh gpt-5.6-sol
@@ -121,19 +125,23 @@ claude --model custom
 # Build
 docker build --build-arg VERSION=1.0.0 -t claude-proxy .
 
-# Run (free OpenCode models — OpenCode is the default, nothing to set)
-docker run --rm -p 127.0.0.1:3000:3000 claude-proxy
+# Run with free OpenCode models (free pricing still requires a Zen account key)
+docker run --rm -p 127.0.0.1:3000:3000 \
+  -e ZEN_API_KEY="$ZEN_API_KEY" \
+  claude-proxy
 
 # Run with OpenRouter as an extra upstream (declare it + wire models to it)
 docker run --rm -p 127.0.0.1:3000:3000 \
+  -e ZEN_API_KEY="$ZEN_API_KEY" \
   -e UPSTREAMS='[{"name":"openrouter","base_url":"https://openrouter.ai/api","api_key":"sk-or-..."}]' \
-  -e MODELS='[{"name":"openai/gpt-4o","upstream":"openrouter"},{"name":"big-pickle","upstream":"opencode"}]' \
+  -e MODELS='[{"name":"openai/gpt-4o","upstream":"openrouter"},{"name":"big-pickle","upstream":"zen"}]' \
   -e ALLOW_UNLISTED_MODELS=true \
   claude-proxy
 
 # Run with API key passthrough (each client authenticates itself)
 docker run --rm -p 0.0.0.0:3000:3000 \
-  -e UPSTREAMS='[{"name":"openrouter","base_url":"https://openrouter.ai/api","api_key":"public"}]' \
+  -e UPSTREAMS='[{"name":"openrouter","base_url":"https://openrouter.ai/api","api_key":""}]' \
+  -e MODELS='openai/gpt-4o@openrouter' \
   -e UPSTREAM_API_KEY_PASSTHROUGH=true \
   -e ALLOW_UNLISTED_MODELS=true \
   claude-proxy
@@ -141,7 +149,9 @@ docker run --rm -p 0.0.0.0:3000:3000 \
 
 **Docker Hub image:**
 ```bash
-docker run --rm -p 127.0.0.1:3000:3000 phd59fr/claude-proxy:latest
+docker run --rm -p 127.0.0.1:3000:3000 \
+  -e ZEN_API_KEY="$ZEN_API_KEY" \
+  phd59fr/claude-proxy:latest
 ```
 
 ### 🐳 Docker Compose
@@ -154,10 +164,11 @@ cp config.example.json config.json
 # Or create a minimal config.json manually.
 cat > config.json << 'EOF'
 {
+  "zen_api_key": "REPLACE_WITH_OPENCODE_ZEN_KEY",
   "models": [
-    {"name": "big-pickle", "upstream": "opencode"},
+    {"name": "big-pickle", "upstream": "zen"},
     {"name": "gpt-5.6-terra", "upstream": "codex"},
-    {"name": "deepseek-v4-flash-free", "upstream": "opencode"}
+    {"name": "nemotron-3.5-lightning-free", "upstream": "zen"}
   ]
 }
 EOF
@@ -201,6 +212,11 @@ The login flow:
 
 ### Available Codex Models
 
+The proxy fetches your account's real Codex catalog from ChatGPT's backend API
+(`GET chatgpt.com/backend-api/codex/models`), honors each entry's visibility
+(`list`) and `priority`, and uses it for `claude-proxy models`, the banner, and
+`/v1/models`. Common examples:
+
 | Model | Description |
 |-------|-------------|
 | `gpt-5.6-sol` | GPT-5.6 Sol - detail and polish, medium reasoning |
@@ -211,7 +227,8 @@ The login flow:
 
 Effort suffixes work: `gpt-5.6-sol-high`, `gpt-5.4-mini-xhigh`, etc.
 
-> Legacy models (`gpt-5.1`, `gpt-5.2`, `gpt-5.1-codex`, etc.) are deprecated and auto-map to `gpt-5.6-sol`.
+The account catalog is the source of truth for model names — legacy models not
+present in it are no longer force-remapped to a local list.
 
 ### How Codex Routing Works
 
@@ -251,11 +268,12 @@ claude-proxy check            # Validate config + connectivity
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--listen` | `127.0.0.1:3000` | Listen address (CLI format; config file uses `listen_port`) |
-| `--upstream` | `https://opencode.ai/zen/v1` | Default upstream base URL |
-| `--upstream-key` | `public` | Default upstream API key |
+| `--zen-base-url` | `https://opencode.ai/zen/v1` | Zen base URL for the built-in `zen` upstream |
+| `--upstream` | (none) | Deprecated alias for `--zen-base-url` |
+| `--zen-key` | (none) | OpenCode Zen API key for the built-in `zen` upstream |
 | `--inbound-key` | (none) | Inbound auth key |
 | `--passthrough-key` | `false` | Forward inbound API key to upstream |
-| `--default-model` | `big-pickle` | Legacy default model (prefer `--models`) |
+| `--default-model` | (none, discovery) | Legacy default model (prefer `--models`) |
 | `--fallback-models` | (none) | Legacy fallback model list (prefer `--models`) |
 | `--models` | (none) | Unified ordered model list: `name@upstream` entries or JSON (1st = default) |
 | `--upstreams` | (none) | JSON array of extra upstreams: `[{"name","base_url","api_key"}, ...]` |
@@ -279,11 +297,13 @@ claude-proxy check            # Validate config + connectivity
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LISTEN_ADDR` | `127.0.0.1:3000` | Listen address |
-| `UPSTREAM_BASE_URL` | `https://opencode.ai/zen/v1` | Default upstream base URL |
-| `UPSTREAM_API_KEY` | `public` | Default upstream API key |
+| `ZEN_BASE_URL` | `https://opencode.ai/zen/v1` | Zen base URL for the built-in `zen` upstream |
+| `UPSTREAM_BASE_URL` | (none) | Deprecated alias for `ZEN_BASE_URL` |
+| `ZEN_API_KEY` | (none) | OpenCode Zen API key for the built-in `zen` upstream |
+| `UPSTREAM_API_KEY` | (none) | Deprecated alias for `ZEN_API_KEY` |
 | `UPSTREAM_API_KEY_PASSTHROUGH` | `false` | Forward inbound API key |
 | `INBOUND_API_KEY` | (none) | Inbound auth key |
-| `DEFAULT_MODEL` | `big-pickle` | Legacy default model (prefer `MODELS`) |
+| `DEFAULT_MODEL` | (none, discovery) | Legacy default model (prefer `MODELS`) |
 | `FALLBACK_MODELS` | (none) | Legacy fallback model list (prefer `MODELS`) |
 | `MODELS` | (none) | Ordered model list: `name@upstream` entries or JSON (1st = default) |
 | `UPSTREAMS` | (none) | JSON array of extra upstreams: `[{"name","base_url","api_key"}, ...]` |
@@ -291,6 +311,7 @@ claude-proxy check            # Validate config + connectivity
 | `COMPLETION_MODEL` | (none) | Model for standard completions |
 | `ALLOW_UNLISTED_MODELS` | `false` | Allow any model |
 | `EXPOSE_ALL_MODELS` | `false` | Show all upstream models |
+| `ONLY_PREFERRED_MODELS` | `false` | Only use models from the configured preference list, do not fall back to discovered models |
 | `REQUEST_TIMEOUT` | `300s` | Request timeout |
 | `MODEL_CACHE_TTL` | `5m` | Model list cache TTL |
 | `LOG_LEVEL` | `info` | Log level |
@@ -302,50 +323,52 @@ claude-proxy check            # Validate config + connectivity
 | `WEBINTERFACE` | (none) | Web interface port (empty = disabled) |
 | `WEBINTERFACE_KEY` | (none) | Web interface administration key |
 
-> The built-in `opencode` upstream is hardcoded to OpenCode's free endpoint. To use
+> The built-in `opencode` upstream is hardcoded to OpenCode Zen. To use
 > other OpenAI-compatible backends (OpenRouter, OpenAI, a self-hosted endpoint, …),
 > declare them in `UPSTREAMS` and reference them by name in the `models` list — there is
 > no need to repoint `opencode` itself.
 
 ### Config File (JSON)
 
-The config file (`config.json`) stores the persistent configuration. OpenCode is implicit and does not need to appear in the file.
+The config file (`config.json`) stores the persistent configuration. OpenCode is implicit, but Zen routes require an API key created at `https://opencode.ai/auth`.
 
 ```json
 {
   "listen_port": "3000",
+  "zen_api_key": "REPLACE_WITH_OPENCODE_ZEN_KEY",
   "models": [
-    {"name": "big-pickle", "upstream": "opencode"},
+    {"name": "big-pickle", "upstream": "zen"},
     {"name": "gpt-5.6-terra", "upstream": "codex"},
     {"name": "my-model", "upstream": "custom"}
   ],
   "upstreams": [
     {"name": "custom", "base_url": "https://my-server/v1", "api_key": "sk-..."}
   ],
+  "only_preferred_models": false,
   "reasoning_model": "gpt-5.6-sol",
   "completion_model": "big-pickle"
 }
 ```
 
-Fields only written when non-empty or overridden: `upstream_base_url`, `upstreams`, `codex_*`, `inbound_api_key`, `upstream_api_key` (when not `public`), `web_interface_key`.
+Fields only written when non-empty or overridden: `zen_base_url`, `upstreams`, `codex_*`, `inbound_api_key`, `zen_api_key` (legacy `upstream_base_url`/`upstream_api_key` also accepted), `web_interface_key`.
 
 > Codex tokens (`codex_*`) are written by `codex-login` and refreshed on each startup.
 
 ### 📋 Unified `models` list (with explicit upstream)
 
-The `models` list is the single ordered preference list. The **first entry is the default** and the proxy tries each entry in order on 429/502/503/504. `/v1/models` returns this configured, deduplicated list in priority order (including configured custom and authenticated Codex routes); upstream catalog discovery is only appended when `EXPOSE_ALL_MODELS=true`. Crucially, **the model name you type in Claude Code is ignored** — the proxy always walks this list in priority order, so whatever you set in Claude (`big-pickle`, any custom name, etc.) just triggers the same ordered chain.
+The `models` list is the single ordered preference list. The **first entry is the default** and the proxy tries each entry in order on 429/502/503/504. When `models` is **empty**, the proxy auto-discovers the compatible free models exposed by Zen (and your account's Codex catalog when authenticated) and uses them as the preference list until you define one explicitly — `big-pickle` is simply whichever free model leads the discovered set, not a hardcoded default. `/v1/models` returns the configured, deduplicated list in priority order plus the discovered Zen and Codex catalogs. Crucially, **the model name you type in Claude Code is ignored** — the proxy always walks the effective list in priority order, so whatever you set in Claude triggers the same ordered chain.
 
 Each entry names the **upstream** that serves it. The built-in upstream is
-`"opencode"` (OpenCode's free endpoint, hardcoded by default);
+`"zen"` (OpenCode Zen, hardcoded by default and authenticated with `zen_api_key`);
 `"codex"` is the ChatGPT Codex backend; any other name must match an entry in
 the `upstreams` list.
 
 ```json
 {
   "models": [
-    {"name": "big-pickle",        "upstream": "opencode"},
+    {"name": "big-pickle",        "upstream": "zen"},
     {"name": "gpt-5.6-terra",     "upstream": "codex"},
-    {"name": "deepseek-v4-flash-free", "upstream": "opencode"},
+    {"name": "nemotron-3.5-lightning-free", "upstream": "zen"},
     {"name": "my-model",          "upstream": "custom"}
   ]
 }
@@ -354,9 +377,9 @@ the `upstreams` list.
 **Formats.** The `models` field (and the `--models` flag / `MODELS` env) accept:
 - a JSON array of objects: `[{"name": "...", "upstream": "..."}, ...]`
   - a legacy JSON array of strings: `["big-pickle", "gpt-5.6-terra"]` — each is
-  treated as `{name, upstream: "opencode"}` (backward-compatible)
+  treated as `{name, upstream: "zen"}` (backward-compatible)
 - a `name@upstream` comma list: `--models big-pickle,gpt-5.6-terra@codex,my-model@custom`
-  (a bare `name` defaults to `opencode`)
+  (a bare `name` defaults to `zen`; legacy `@opencode` is accepted and mapped to `zen`)
 
 Set it via flag
 (`--models big-pickle,gpt-5.6-terra@codex,...`), env (`MODELS=...`), or the JSON
@@ -394,7 +417,7 @@ Each client authenticates with its own upstream API key:
 ```bash
 # Start with passthrough (declare the upstream, wire models to it)
 ./claude-proxy serve --passthrough-key \
-  --upstreams '[{"name":"openrouter","base_url":"https://openrouter.ai/api","api_key":"public"}]' \
+  --upstreams '[{"name":"openrouter","base_url":"https://openrouter.ai/api","api_key":""}]' \
   --models 'openai/gpt-4o@openrouter'
 
 # Client sends its own key
@@ -406,7 +429,7 @@ curl -X POST http://127.0.0.1:3000/v1/messages \
 
 The proxy forwards the client's key as `Authorization: Bearer <key>` to the upstream.
 
-> ⚠️ In passthrough mode every inference request **must** include its own `x-api-key` or `Authorization: Bearer` credential. Passthrough cannot be combined with a non-public API key on any configured upstream. Do not expose the proxy publicly without TLS and appropriate network controls.
+> ⚠️ In passthrough mode every inference request **must** include its own `x-api-key` or `Authorization: Bearer` credential. The caller key overrides any configured service key for inference. Do not expose the proxy publicly without TLS and appropriate network controls.
 
 ### 🧠 Thinking / Completion Model Routing
 
@@ -426,11 +449,11 @@ Route requests to different models based on extended thinking:
 
 When the preferred model is unavailable (rate limit 429, upstream errors 502/503/504, or a connection failure before the upstream responds), the proxy automatically tries the next model in the preference list. Codex models in the preference list are routed through the Codex backend with OAuth auth, not the regular upstream. Once a streaming response has started, the proxy cannot switch upstreams without corrupting SSE, so stream failures after the first event are terminal.
 
-Models that fail are **disabled by a circuit breaker for 15 minutes**. During that window the proxy skips them and tries the next available model. After 15 minutes the model is retried; if it fails again it is disabled for another 15 minutes.
+Models that fail are **disabled by a circuit breaker**. A single rate limit (429) — or an upstream-wide quota (`usage_limit_reached`) that disables the whole upstream — is a short **1-minute** cooldown; a second consecutive 429 or a transport error (5xx/connection failure) is disabled for **1 hour**. During that window the proxy skips the model and tries the next available one, then retries it after the cooldown expires. Only a genuine 4xx "model not found" (e.g. `model_not_found`) marks a model **permanently** unavailable — transient 429/5xx bodies never do, so a healthy model is never hidden because of a temporary glitch.
 
 ```bash
 ./claude-proxy serve \
-  --models big-pickle,gpt-5.6-terra@codex,deepseek-v4-flash-free,hy3-free
+  --models big-pickle,gpt-5.6-terra@codex,nemotron-3.5-lightning-free,hy3-free
 ```
 
 > **Tip:** Use the unified `--models` / `MODELS` / `models:` field to set one ordered
@@ -441,63 +464,65 @@ Models that fail are **disabled by a circuit breaker for 15 minutes**. During th
 **Flow:**
 ```
 Request → gpt-5.6-sol (1st choice)
-  │ 429 rate limit / 502 / 503 / 504 → disabled 15 min
+  │ 429 / 502 / 503 / 504 → disabled (circuit breaker)
   ▼
   → gpt-5.4 (2nd choice)
-    │ 429 / 502 / 503 / 504 → disabled 15 min
+    │ 429 / 502 / 503 / 504 → disabled (circuit breaker)
     ▼
     → gpt-5.4-mini (3rd choice)
-      │ 429 / 502 / 503 / 504 → disabled 15 min
+      │ 429 / 502 / 503 / 504 → disabled (circuit breaker)
       ▼
-      → deepseek-v4-flash-free (last resort)
+      → nemotron-3.5-lightning-free (last resort)
         │ All exhausted
         ▼
         → 429 error to client with Retry-After header
 ```
 
+> Cooldowns: a single 429 and an upstream-wide quota = 1 minute; a second
+> consecutive 429 and transport errors = 1 hour. See the circuit breaker note above.
+
 If a requested model name isn't the configured default, the proxy falls back to the default model with a warning log.
 
 ### ✅ Startup Validation
 
-At startup, the proxy binds its HTTP listener immediately and prints the configured routing order. The upstream catalog refresh then runs asynchronously, so an unavailable provider cannot block `/healthz`. Use `/readyz` (with the configured inbound credentials) to check whether the first configured route is usable.
+At startup, the proxy binds its HTTP listener before model probes run, so an unavailable provider cannot block `/healthz`. Use `/readyz` (with the configured inbound credentials and, in passthrough mode, a caller upstream key) to perform a real minimal inference probe against the first effective route.
 
 ### 📋 Models Command
 
-`./claude-proxy models` lists the models available on each configured upstream:
+`./claude-proxy models` lists the models available on each configured upstream and the discovered catalogs:
 
 ```bash
 $ ./claude-proxy models
 
-Codex models (ChatGPT subscription):
+Codex models (discovered from your ChatGPT account):
   gpt-5.6-sol ✅
   gpt-5.6-terra ✅
-  gpt-5.6-luna ❌ model not found
   gpt-5.4 ✅
   gpt-5.4-mini ✅
 
-Free models (included by default):
-  big-pickle ✅ (default)
-  deepseek-v4-flash-free ✅
+Free models (discovered from Zen; contributor models are opt-in):
+  [first-env.free] ✅ (default)
   hy3-free ✅
   mimo-v2.5-free ✅
   nemotron-3-ultra-free ✅
-  north-mini-code-free ✅
-
-Total: 6 free, 5 codex, 55 upstream
+  nemotron-3.5-lightning-free ✅
 ```
+
+The exact entries and counts come from the live Zen and Codex catalogs, not a
+hardcoded list. Contributor models (`*-contributor-free`) are discovered but
+kept out of the default routing chain until listed explicitly.
 
 Model selection at request time is driven entirely by the ordered `models` list — see [🗺️ Model Names in Claude Code](#-model-names-in-claude-code).
 
 ## 🗺️ Model Names in Claude Code
 
-The model name you type in Claude Code (e.g. `big-pickle`, `claude-opus-4-8`, or any custom name) is ignored — the proxy always walks `models` in priority order regardless of what you type, so there is no alias table to configure or display.
+The model name you type in Claude Code (e.g. any custom name) is ignored — the proxy always walks the effective model order (configured or discovered) regardless of what you type, so there is no alias table to configure or display.
 
 ## 🛡️ Allowed Models
 
-By default, only these models are allowed:
-- `big-pickle`
-- Any model ending in `-free`
-- Codex models (when tokens are present): `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4`, `gpt-5.4-mini`
+By default, only the models in the ordered `models` list (plus any `reasoning_model`
+/ `completion_model`) are allowed. When `models` is empty, that means the
+auto-discovered compatible free models and your authenticated Codex catalog.
 
 Set `ALLOW_UNLISTED_MODELS=true` to allow any model name (required for OpenRouter, OpenAI, etc.).
 
@@ -533,7 +558,7 @@ If the port is empty or not set, the web interface is **disabled**.
 
 ### Authentication
 
-When the interface starts without `web_interface_key` / `WEBINTERFACE_KEY`, it generates a random administration key, persists it in `config.json`, and prints it **once** in the startup console together with a one-time browser URL:
+The dashboard includes a write-only field for the OpenCode Zen API key. When the interface starts without `web_interface_key` / `WEBINTERFACE_KEY`, it generates a random administration key, persists it in `config.json`, and prints it **once** in the startup console together with a one-time browser URL:
 
 ```text
 Web interface key (shown once): <generated-key>
@@ -549,10 +574,10 @@ The URL establishes an HttpOnly, SameSite session cookie. API requests can also 
   - Red `●`: last probe failed or the circuit breaker is active.
   - Grey `●`: model has not been probed yet.
   - The status includes the last probe time/error and circuit-breaker expiry when applicable.
-- **Ordered preference list**: move configured models up/down with ▲▼. The first configured model is always the default — there is no separate default-model field.
+- **Ordered preference list**: move configured models up/down with ▲▼. The first configured model is always the default — there is no separate default-model field. Reordering takes effect on the running proxy immediately (no restart needed) and is persisted.
 - **Reasoning / completion routing**: select a route using status-aware model pills. Choose **First in order** to use the normal preference list, or one configured model to try it first before the remaining ordered routes.
 - **Test models**: probe a single model or **Test All**; every result updates the shared in-memory status used by the proxy and dashboard.
-- **Circuit breaker**: inspect and reset the real 15-minute runtime circuit breaker state.
+- **Circuit breaker**: inspect and reset the real runtime circuit breaker state.
 - **Custom upstreams**: add, edit or remove provider name/base URL/API key entries. API keys are write-only.
 - **Configuration forms**: edit security controls, timeouts, cache, request limits, logging, ports and provider settings through named fields rather than raw JSON.
 - **Codex reconnect**: the **Re-login with ChatGPT** button starts the OAuth flow and opens the ChatGPT authorization page.
@@ -572,15 +597,19 @@ Open `http://localhost:8080` in your browser after starting the proxy with `WEBI
 │       └── main.go              # Entry point, CLI subcommands, config wizard
 ├── internal/
 │   ├── anthropic/               # Anthropic API types
-│   ├── codex/                   # Codex backend (OAuth, transform, stream, models)
 │   ├── config/                  # Config loading (flags, env, JSON)
 │   ├── convert/                 # Protocol translation (request, response, stream)
+│   ├── ioutil/                  # Streaming I/O helpers (idle-timeout reader)
 │   ├── log/                     # Structured logger (text/json, key masking)
 │   ├── models/                  # Model catalog, filtering
 │   ├── openai/                  # OpenAI API types, SSE stream parser
-│   ├── proxy/                   # HTTP server, handlers, middleware
-│   ├── upstream/                # Upstream HTTP clients (standard + Codex)
-│   └── web/                     # Web dashboard (model management, uptime)
+│   ├── providers/               # Provider abstraction (zen, codex, errs + registry)
+│   │   ├── codex/               # ChatGPT Codex backend (OAuth, transform, stream)
+│   │   ├── errs/                # Sentinel errors shared across providers
+│   │   └── zen/                 # OpenCode Zen / OpenAI-compatible upstream
+│   ├── proxy/                   # HTTP server, handlers, middleware, fallback
+│   ├── web/                     # Web dashboard (model management, uptime)
+│   └── zenintegration/          # Integration tests against the zen upstream
 ├── scripts/
 │   ├── claude-proxy.sh          # Launcher script (OpenCode models)
 │   ├── claude-codex.sh          # Launcher script (Codex models)
@@ -605,7 +634,9 @@ Open `http://localhost:8080` in your browser after starting the proxy with `WEBI
 
 ### ⚠️ Privacy Notice
 
-Free model availability and public access may change without notice. **Review the upstream provider's privacy and retention policy before sending sensitive data.**
+Free model availability and pricing may change without notice. Free models still require an authenticated Zen account. **Review the upstream provider's privacy and retention policy before sending sensitive data.**
+
+`muse-spark-1.2-contributor-free` is opt-in and is not part of the default fallback chain: its prompts and completions may be used to train future Meta models. It uses Zen's Responses API, which the proxy routes automatically when explicitly configured.
 
 Avoid sending secrets, credentials, Kubernetes configs, `.env` files, customer data, or confidential code without reviewing the upstream provider's privacy policy.
 
@@ -665,7 +696,7 @@ Two GitHub Actions workflows run automatically:
 
 ## 📊 Logging
 
-On startup, the proxy first checks the configured, free, and known Codex models, then prints a banner before normal runtime logs. A green `●` means the probe succeeded; a red `●` means it failed or Codex is not authenticated.
+On startup, the proxy probes the configured model routes, the discovered free Zen catalog, and the account Codex catalog, then prints a banner before normal runtime logs. A green `●` means the probe succeeded; a red `●` means it failed or Codex is not authenticated.
 
 ```
 ╔═════════════════════════════════════════════════════════╗
@@ -675,22 +706,21 @@ On startup, the proxy first checks the configured, free, and known Codex models,
 ║   Port:     3000                                        ║
 ╠═════════════════════════════════════════════════════════╣
 ║   Ordered models (proxy priority)                       ║
-║     * 1. big-pickle@opencode                            ║
+║     * 1. big-pickle@zen                                 ║
 ║       2. gpt-5.6-terra@codex                            ║
-║       3. deepseek-v4-flash-free@opencode                ║
-║       4. hy3-free@opencode                              ║
-║       5. mimo-v2.5-free@opencode                        ║
-║       6. nemotron-3-ultra-free@opencode                 ║
-║       7. north-mini-code-free@opencode                  ║
+║       3. mimo-v2.5-free@zen                             ║
+║       4. hy3-free@zen                                   ║
+║       5. nemotron-3-ultra-free@zen                      ║
+║       6. nemotron-3.5-lightning-free@zen                ║
 ╠═════════════════════════════════════════════════════════╣
 ║   Available models                                      ║
 ║     ● big-pickle                                        ║
 ║     ● gpt-5.6-terra                                     ║
-║     ● deepseek-v4-flash-free                            ║
-║     ● hy3-free                                          ║
 ║     ● mimo-v2.5-free                                    ║
+║     ● hy3-free                                          ║
 ║     ● nemotron-3-ultra-free                             ║
-║     ● north-mini-code-free                              ║
+║     ● nemotron-3.5-lightning-free                       ║
+║     ● muse-spark-1.2-contributor-free                   ║
 ║     ● gpt-5.6                                           ║
 ║     ● gpt-5.6-sol                                       ║
 ║     ● gpt-5.6-luna                                      ║

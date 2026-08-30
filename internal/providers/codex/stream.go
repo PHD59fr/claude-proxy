@@ -54,6 +54,30 @@ func ParseCodexStreamWithTimeout(ctx context.Context, reader io.Reader, idleTime
 	return parseCodexStreamInternal(ctx, reader, idleTimeout)
 }
 
+// ParseResponsesStreamWithTimeout parses a standard Responses API stream and
+// rejects an EOF that arrives before a terminal response event.
+func ParseResponsesStreamWithTimeout(ctx context.Context, reader io.Reader, idleTimeout time.Duration) <-chan CodexStreamChunk {
+	source := ParseCodexStreamWithTimeout(ctx, reader, idleTimeout)
+	out := make(chan CodexStreamChunk, 16)
+	go func() {
+		defer close(out)
+		terminal, failed := false, false
+		for chunk := range source {
+			if chunk.Done != nil {
+				terminal = true
+			}
+			if chunk.Err != nil {
+				failed = true
+			}
+			out <- chunk
+		}
+		if !terminal && !failed {
+			out <- CodexStreamChunk{Err: fmt.Errorf("responses API stream ended before a terminal event")}
+		}
+	}()
+	return out
+}
+
 // parseCodexStreamInternal is the core implementation with a configurable idle timeout.
 func parseCodexStreamInternal(ctx context.Context, reader io.Reader, idleTimeout time.Duration) <-chan CodexStreamChunk {
 	ch := make(chan CodexStreamChunk, 16)
@@ -161,24 +185,23 @@ func parseCodexStreamInternal(ctx context.Context, reader io.Reader, idleTimeout
 // response.output_text.delta so the response.done fallback does not duplicate it.
 func processCodexEvent(ch chan<- CodexStreamChunk, eventType, data string, streamedArgs map[string]bool, itemIndex map[string]int, streamedText map[string]bool) {
 	switch eventType {
-	case "response.done":
+	case "response.done", "response.completed", "response.incomplete":
 		var event ResponsesEvent
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
-			ch <- CodexStreamChunk{Err: fmt.Errorf("parse response.done: %w", err)}
+			ch <- CodexStreamChunk{Err: fmt.Errorf("parse %s: %w", eventType, err)}
 			return
 		}
+
 		if event.Response != nil {
 			// Fallback: some backends only include the full arguments in the
 			// final response. Emit them for any function call whose arguments
 			// were not already streamed incrementally.
 			//
-			// We track a monotonically increasing index for emitted tool calls
-			// so that a function_call whose itemIndex was never populated (e.g.
-			// a backend that streams arguments deltas without a preceding
-			// output_item.added) still gets a unique, collision-free index
-			// instead of defaulting to 0.
-			fallbackIdx := 0
-			for _, item := range event.Response.Output {
+			// The index comes from output_item.added where known; otherwise we
+			// use the item's position in Output, which is a stable, unique index
+			// that cannot collide with the indices already assigned by
+			// output_item.added (unlike a counter restarting at 0).
+			for i, item := range event.Response.Output {
 				if item.Type != "function_call" {
 					// Emit text from message output items so it is not lost
 					// when response.output_text.delta events are absent.
@@ -197,8 +220,7 @@ func processCodexEvent(ch chan<- CodexStreamChunk, eventType, data string, strea
 				if item.Arguments != "" && item.Arguments != "{}" {
 					idx, ok := itemIndex[item.ID]
 					if !ok {
-						idx = fallbackIdx
-						fallbackIdx++
+						idx = i
 					}
 					ch <- CodexStreamChunk{ToolCallDelta: &ToolCallDeltaInfo{
 						Index:     idx,
@@ -210,6 +232,9 @@ func processCodexEvent(ch chan<- CodexStreamChunk, eventType, data string, strea
 			}
 			ch <- CodexStreamChunk{Done: event.Response}
 		}
+
+	case "response.failed":
+		ch <- CodexStreamChunk{Err: fmt.Errorf("responses API request failed")}
 
 	case "response.output_text.delta":
 		var event ResponsesEvent

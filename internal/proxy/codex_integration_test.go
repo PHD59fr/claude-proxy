@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/claude-code-opencode/claude-proxy/internal/codex"
 	"github.com/claude-code-opencode/claude-proxy/internal/config"
 	"github.com/claude-code-opencode/claude-proxy/internal/log"
 	"github.com/claude-code-opencode/claude-proxy/internal/models"
-	"github.com/claude-code-opencode/claude-proxy/internal/upstream"
+	"github.com/claude-code-opencode/claude-proxy/internal/providers"
+	"github.com/claude-code-opencode/claude-proxy/internal/providers/codex"
 )
 
 // capturedCodexRequest stores what the mock Codex backend received.
@@ -88,8 +88,8 @@ func TestCodexViaProxy_FullFlow(t *testing.T) {
 	defer opencodeMock.Close()
 
 	cfg := config.DefaultConfig()
-	cfg.UpstreamBaseURL = opencodeMock.URL
-	cfg.UpstreamAPIKey = "test-key"
+	cfg.ZenBaseURL = opencodeMock.URL
+	cfg.ZenAPIKey = "test-key"
 	cfg.DefaultModel = "gpt-5.6-terra"
 	cfg.AllowUnlisted = true
 	cfg.CodexOAuthToken = "test-codex-token"
@@ -101,11 +101,11 @@ func TestCodexViaProxy_FullFlow(t *testing.T) {
 	cfg.Precompute()
 
 	logger := log.New("debug", "text")
-	codexClient := upstream.NewCodexClient(codexMock.baseURL(), cfg.CodexOAuthToken, cfg.CodexAccountID, 30*time.Second)
-	router := upstream.NewRouter([]config.UpstreamConfig{
-		{Name: config.DefaultUpstreamName, BaseURL: opencodeMock.URL, APIKey: cfg.UpstreamAPIKey},
+	codexClient := codex.NewClient(codexMock.baseURL(), cfg.CodexOAuthToken, cfg.CodexAccountID, 30*time.Second)
+	router := providers.NewRegistry([]config.UpstreamConfig{
+		{Name: config.DefaultUpstreamName, BaseURL: opencodeMock.URL, APIKey: cfg.ZenAPIKey},
 	}, codexClient, 30*time.Second)
-	catalog := models.NewCatalog(opencodeMock.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	catalog := models.NewCatalog(opencodeMock.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, logger)
 
 	// Simulate Claude Code request
@@ -161,8 +161,8 @@ func TestCodexViaProxy_FallbackOn400(t *testing.T) {
 	defer opencodeMock.Close()
 
 	cfg := config.DefaultConfig()
-	cfg.UpstreamBaseURL = opencodeMock.URL
-	cfg.UpstreamAPIKey = "test-key"
+	cfg.ZenBaseURL = opencodeMock.URL
+	cfg.ZenAPIKey = "test-key"
 	cfg.DefaultModel = "gpt-5.6-terra"
 	cfg.AllowUnlisted = true
 	cfg.CodexOAuthToken = "test-token"
@@ -174,11 +174,11 @@ func TestCodexViaProxy_FallbackOn400(t *testing.T) {
 	cfg.Precompute()
 
 	logger := log.New("debug", "text")
-	codexClient := upstream.NewCodexClient(codexMock.baseURL(), "test-token", "test-acct", 30*time.Second)
-	router := upstream.NewRouter([]config.UpstreamConfig{
-		{Name: config.DefaultUpstreamName, BaseURL: opencodeMock.URL, APIKey: cfg.UpstreamAPIKey},
+	codexClient := codex.NewClient(codexMock.baseURL(), "test-token", "test-acct", 30*time.Second)
+	router := providers.NewRegistry([]config.UpstreamConfig{
+		{Name: config.DefaultUpstreamName, BaseURL: opencodeMock.URL, APIKey: cfg.ZenAPIKey},
 	}, codexClient, 30*time.Second)
-	catalog := models.NewCatalog(opencodeMock.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	catalog := models.NewCatalog(opencodeMock.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, logger)
 
 	body := `{"model":"custom","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"test"}]}`
@@ -238,8 +238,8 @@ func TestCodexViaProxy_ConcurrentRequests(t *testing.T) {
 	defer opencodeMock.Close()
 
 	cfg := config.DefaultConfig()
-	cfg.UpstreamBaseURL = opencodeMock.URL
-	cfg.UpstreamAPIKey = "test-key"
+	cfg.ZenBaseURL = opencodeMock.URL
+	cfg.ZenAPIKey = "test-key"
 	cfg.DefaultModel = "gpt-5.6-terra"
 	cfg.AllowUnlisted = true
 	cfg.CodexOAuthToken = "tok"
@@ -251,11 +251,11 @@ func TestCodexViaProxy_ConcurrentRequests(t *testing.T) {
 	cfg.Precompute()
 
 	logger := log.New("debug", "text")
-	codexClient := upstream.NewCodexClient(codexMock.baseURL(), "tok", "acct", 30*time.Second)
-	router := upstream.NewRouter([]config.UpstreamConfig{
-		{Name: config.DefaultUpstreamName, BaseURL: opencodeMock.URL, APIKey: cfg.UpstreamAPIKey},
+	codexClient := codex.NewClient(codexMock.baseURL(), "tok", "acct", 30*time.Second)
+	router := providers.NewRegistry([]config.UpstreamConfig{
+		{Name: config.DefaultUpstreamName, BaseURL: opencodeMock.URL, APIKey: cfg.ZenAPIKey},
 	}, codexClient, 30*time.Second)
-	catalog := models.NewCatalog(opencodeMock.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	catalog := models.NewCatalog(opencodeMock.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, logger)
 
 	// Send 5 concurrent requests (like Claude Code parallel subagents)
@@ -315,8 +315,8 @@ func TestCodexViaProxy_RequestBodyFormat(t *testing.T) {
 	defer opencodeMock.Close()
 
 	cfg := config.DefaultConfig()
-	cfg.UpstreamBaseURL = opencodeMock.URL
-	cfg.UpstreamAPIKey = "test-key"
+	cfg.ZenBaseURL = opencodeMock.URL
+	cfg.ZenAPIKey = "test-key"
 	cfg.DefaultModel = "gpt-5.6-terra"
 	cfg.AllowUnlisted = true
 	cfg.CodexOAuthToken = "tok"
@@ -328,11 +328,11 @@ func TestCodexViaProxy_RequestBodyFormat(t *testing.T) {
 	cfg.Precompute()
 
 	logger := log.New("debug", "text")
-	codexClient := upstream.NewCodexClient(codexMock.baseURL(), "tok", "acct", 30*time.Second)
-	router := upstream.NewRouter([]config.UpstreamConfig{
-		{Name: config.DefaultUpstreamName, BaseURL: opencodeMock.URL, APIKey: cfg.UpstreamAPIKey},
+	codexClient := codex.NewClient(codexMock.baseURL(), "tok", "acct", 30*time.Second)
+	router := providers.NewRegistry([]config.UpstreamConfig{
+		{Name: config.DefaultUpstreamName, BaseURL: opencodeMock.URL, APIKey: cfg.ZenAPIKey},
 	}, codexClient, 30*time.Second)
-	catalog := models.NewCatalog(opencodeMock.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	catalog := models.NewCatalog(opencodeMock.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, logger)
 
 	// Send with tools and thinking (like Claude Code does)
@@ -410,8 +410,8 @@ func TestCodexViaProxy_NonStreamingFallback(t *testing.T) {
 	defer opencodeMock.Close()
 
 	cfg := config.DefaultConfig()
-	cfg.UpstreamBaseURL = opencodeMock.URL
-	cfg.UpstreamAPIKey = "test-key"
+	cfg.ZenBaseURL = opencodeMock.URL
+	cfg.ZenAPIKey = "test-key"
 	cfg.DefaultModel = "gpt-5.6-terra"
 	cfg.AllowUnlisted = true
 	cfg.CodexOAuthToken = "tok"
@@ -423,11 +423,11 @@ func TestCodexViaProxy_NonStreamingFallback(t *testing.T) {
 	cfg.Precompute()
 
 	logger := log.New("debug", "text")
-	codexClient := upstream.NewCodexClient(codexMock.baseURL(), "tok", "acct", 30*time.Second)
-	router := upstream.NewRouter([]config.UpstreamConfig{
-		{Name: config.DefaultUpstreamName, BaseURL: opencodeMock.URL, APIKey: cfg.UpstreamAPIKey},
+	codexClient := codex.NewClient(codexMock.baseURL(), "tok", "acct", 30*time.Second)
+	router := providers.NewRegistry([]config.UpstreamConfig{
+		{Name: config.DefaultUpstreamName, BaseURL: opencodeMock.URL, APIKey: cfg.ZenAPIKey},
 	}, codexClient, 30*time.Second)
-	catalog := models.NewCatalog(opencodeMock.URL, cfg.UpstreamAPIKey, 5*time.Minute)
+	catalog := models.NewCatalog(opencodeMock.URL, cfg.ZenAPIKey, 5*time.Minute)
 	handler := NewHandler(cfg, catalog, router, logger)
 
 	body := `{"model":"custom","max_tokens":100,"stream":false,"messages":[{"role":"user","content":"test"}]}`
